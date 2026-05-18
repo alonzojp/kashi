@@ -24,8 +24,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Inject Groq API key
-        run: sed -i "s|__GROQ_API_KEY__|${{ secrets.GROQ_API_KEY }}|g" index.html
+      - name: Inject API keys
+        run: |
+          sed -i "s|__GROQ_API_KEY__|${{ secrets.GROQ_API_KEY }}|g" index.html
+          sed -i "s|__YT_API_KEY__|${{ secrets.YT_API_KEY }}|g" index.html
 
       - uses: actions/configure-pages@v4
 

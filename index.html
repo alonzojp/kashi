@@ -392,9 +392,10 @@
 <script>
 // ── API key management ────────────────────────────────────────────────────────
 
-const BUILT_IN_KEY = '__GROQ_API_KEY__';
-function getKey()   { return localStorage.getItem('groq_api_key') || (BUILT_IN_KEY.startsWith('__') ? '' : BUILT_IN_KEY); }
-function getYtKey() { return localStorage.getItem('yt_api_key') || ''; }
+const BUILT_IN_KEY    = '__GROQ_API_KEY__';
+const BUILT_IN_YT_KEY = '__YT_API_KEY__';
+function getKey()   { return localStorage.getItem('groq_api_key') || (BUILT_IN_KEY.startsWith('__')    ? '' : BUILT_IN_KEY); }
+function getYtKey() { return localStorage.getItem('yt_api_key')   || (BUILT_IN_YT_KEY.startsWith('__') ? '' : BUILT_IN_YT_KEY); }
 
 function saveSettings() {
   const k = document.getElementById('keyInput').value.trim();
