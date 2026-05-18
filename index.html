@@ -67,7 +67,8 @@
     .modal h2 { font-size: 1.1rem; color: #fff; margin-bottom: 10px; }
     .modal p  { font-size: 0.85rem; color: #888; line-height: 1.6; margin-bottom: 18px; }
     .modal a  { color: var(--red); }
-    .modal input[type="password"] {
+    .modal input[type="password"],
+    .modal input[type="text"] {
       width: 100%; background: var(--bg); border: 1px solid var(--border2);
       border-radius: 8px; color: var(--text); font-size: 0.9rem;
       padding: 10px 12px; outline: none; margin-bottom: 12px; font-family: monospace;
@@ -313,9 +314,17 @@
     <p>
       Word analysis uses <strong>Groq + Llama 3.3</strong> — free with 14,400 requests/day.<br><br>
       Get a free key at <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>.
-      Your key is stored in your browser only — never sent anywhere except Groq.
+      Your key is stored in your browser only.
     </p>
     <input type="password" id="keyInput" placeholder="gsk_..." autocomplete="off" />
+
+    <h2 style="margin-top:18px">YouTube Data API Key <span style="font-size:0.72rem;color:var(--muted);font-weight:400">(optional)</span></h2>
+    <p>
+      Enables fetching lyrics from the video's <strong>pinned comment</strong> when subtitles and the description both fail.<br><br>
+      Get a free key at <a href="https://console.cloud.google.com/apis/library/youtube.googleapis.com" target="_blank" rel="noopener">Google Cloud Console</a> — enable the YouTube Data API v3, create an API key, and paste it here.
+    </p>
+    <input type="text" id="ytKeyInput" placeholder="AIzaSy..." autocomplete="off" />
+
     <div class="modal-btns">
       <button class="btn-ghost" onclick="closeSettings()">Cancel</button>
       <button class="btn-primary" onclick="saveSettings()">Save</button>
@@ -384,18 +393,20 @@
 // ── API key management ────────────────────────────────────────────────────────
 
 const BUILT_IN_KEY = '__GROQ_API_KEY__';
-function getKey() {
-  return localStorage.getItem('groq_api_key')
-    || (BUILT_IN_KEY.startsWith('__') ? '' : BUILT_IN_KEY);
-}
+function getKey()   { return localStorage.getItem('groq_api_key') || (BUILT_IN_KEY.startsWith('__') ? '' : BUILT_IN_KEY); }
+function getYtKey() { return localStorage.getItem('yt_api_key') || ''; }
+
 function saveSettings() {
   const k = document.getElementById('keyInput').value.trim();
   if (k) localStorage.setItem('groq_api_key', k); else localStorage.removeItem('groq_api_key');
+  const y = document.getElementById('ytKeyInput').value.trim();
+  if (y) localStorage.setItem('yt_api_key', y); else localStorage.removeItem('yt_api_key');
   closeSettings();
   updateBanner();
 }
 function openSettings() {
-  document.getElementById('keyInput').value = localStorage.getItem('groq_api_key') || '';
+  document.getElementById('keyInput').value   = localStorage.getItem('groq_api_key') || '';
+  document.getElementById('ytKeyInput').value = localStorage.getItem('yt_api_key')   || '';
   document.getElementById('settingsOverlay').classList.add('open');
 }
 function closeSettings() { document.getElementById('settingsOverlay').classList.remove('open'); }
@@ -511,6 +522,63 @@ function parseXml(xml) {
     if (text) out.push({ startMs: start, endMs: start + dur, text });
   }
   return out;
+}
+
+// ── Description / comment fetching ───────────────────────────────────────────
+
+// Extract consecutive Japanese-looking lines from arbitrary text (description, comment)
+function extractJapaneseLines(text) {
+  const jaRe = /[぀-ゟ゠-ヿ一-鿿ｦ-ﾟ]/;
+  return text.split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 1 && jaRe.test(l))
+    .map((t, i) => ({ startMs: i * 5000, endMs: (i + 1) * 5000, text: t }));
+}
+
+async function fetchFromDescription(videoId) {
+  const proxies = [
+    u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  ];
+  for (const proxy of proxies) {
+    try {
+      const res = await fetch(proxy(`https://www.youtube.com/watch?v=${videoId}`), {
+        signal: AbortSignal.timeout(10000)
+      });
+      if (!res.ok) continue;
+      const html = await res.text();
+      // shortDescription is embedded in ytInitialPlayerResponse as a JSON string value
+      const m = html.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/);
+      if (!m) continue;
+      const desc = m[1]
+        .replace(/\\n/g, '\n')
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, '\\')
+        .replace(/\\u([\da-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+      const lines = extractJapaneseLines(desc);
+      if (lines.length > 2) return lines;
+    } catch {}
+  }
+  return null;
+}
+
+async function fetchPinnedComment(videoId) {
+  const key = getYtKey();
+  if (!key) return null;
+  try {
+    // order=relevance puts the pinned comment first
+    const url = `https://www.googleapis.com/youtube/v3/commentThreads?videoId=${videoId}&part=snippet&order=relevance&maxResults=10&key=${encodeURIComponent(key)}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    for (const item of data.items || []) {
+      const text = item.snippet?.topLevelComment?.snippet?.textOriginal || '';
+      if (!text) continue;
+      const lines = extractJapaneseLines(text);
+      if (lines.length > 3) return lines;
+    }
+  } catch {}
+  return null;
 }
 
 // ── Groq analysis ─────────────────────────────────────────────────────────────
@@ -878,25 +946,50 @@ async function loadVideo() {
   showMainPanel(true);
   createPlayer(videoId);
 
+  // 1. Try YouTube captions
+  setStatus('Checking YouTube captions…');
   const result = await fetchSubtitles(videoId);
+  let source = '';
 
-  if (!result || !result.lines.length) {
-    setStatus('No Japanese subtitles found for this video.', 'error');
+  if (result?.lines.length) {
+    subtitles = result.lines;
+    source = result.auto
+      ? '⚠ Auto-generated captions — accuracy may vary for music'
+      : 'YouTube captions';
+  }
+
+  // 2. Try description
+  if (!subtitles.length) {
+    setStatus('No captions — scanning description…');
+    const descLines = await fetchFromDescription(videoId);
+    if (descLines?.length > 2) { subtitles = descLines; source = 'Lyrics from description'; }
+  }
+
+  // 3. Try pinned/top comment (requires YouTube API key)
+  if (!subtitles.length) {
+    if (getYtKey()) {
+      setStatus('Checking pinned comment…');
+      const commentLines = await fetchPinnedComment(videoId);
+      if (commentLines?.length > 3) { subtitles = commentLines; source = 'Lyrics from pinned comment'; }
+    }
+  }
+
+  if (!subtitles.length) {
+    setStatus('No Japanese lyrics found automatically.', 'error');
     const ci = document.getElementById('captionInfo');
     ci.style.display = 'block';
-    ci.innerHTML = 'No Japanese captions found. Try pasting the lyrics manually below.';
+    ci.innerHTML = 'Could not find lyrics automatically. Try the "Paste lyrics manually" option below'
+      + (getYtKey() ? '' : ', or add a <a onclick="openSettings()" style="color:var(--red);cursor:pointer">YouTube API key</a> to also search the pinned comment.');
     btn.disabled = false;
     return;
   }
 
-  subtitles  = result.lines;
-  videoMode  = true;
+  videoMode = true;
   setStatus(`Loaded ${subtitles.length} lines`, 'ok');
 
   const ci = document.getElementById('captionInfo');
   ci.style.display = 'block';
-  ci.innerHTML = `${subtitles.length} lines`
-    + (result.auto ? ' · <span class="warn">⚠ Auto-generated captions — accuracy may vary for music</span>' : ' · manual captions');
+  ci.innerHTML = `${subtitles.length} lines · <span class="warn">${source}</span>`;
 
   renderLyrics(subtitles);
   btn.disabled = false;
