@@ -289,6 +289,40 @@
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
+    /* ── Sync overlay ───────────────────────────────────── */
+    #syncOverlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.94); z-index: 50;
+      flex-direction: column; align-items: center;
+      justify-content: center; gap: 18px; padding: 24px;
+    }
+    #syncOverlay.open { display: flex; }
+
+    .sync-progress { font-size: 0.75rem; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; }
+    .sync-current  { font-size: 2.4rem; font-weight: 700; color: #fff; text-align: center; max-width: 680px; line-height: 1.4; }
+    .sync-next     { font-size: 1.05rem; color: #555; text-align: center; max-width: 680px; min-height: 1.5em; }
+    .sync-hint     { font-size: 0.8rem; color: #444; margin-top: 4px; }
+
+    .sync-tap-btn {
+      width: 110px; height: 110px; border-radius: 50%;
+      background: var(--red); color: #fff; border: none;
+      font-size: 1rem; font-weight: 700; cursor: pointer;
+      transition: transform 0.08s, background 0.1s;
+      margin: 6px 0;
+    }
+    .sync-tap-btn:active { transform: scale(0.9); background: #c94444; }
+
+    .sync-controls { display: flex; gap: 10px; margin-top: 4px; }
+
+    #syncBtn {
+      font-size: 0.75rem; padding: 5px 12px;
+      background: transparent; color: var(--muted);
+      border: 1px solid var(--border2); border-radius: 6px;
+      cursor: pointer; font-family: inherit;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    #syncBtn:hover { color: var(--text); border-color: #555; }
+
     /* ── Responsive ─────────────────────────────────────── */
     @media (max-width: 720px) {
       #mainPanel { flex-direction: column; }
@@ -377,11 +411,27 @@
   <div id="lyricsCol">
     <div id="lyricsHeader">
       <span class="lbl">Lyrics</span>
-      <span id="lyricsCount" style="font-size:0.78rem;color:var(--muted)"></span>
+      <div style="display:flex;align-items:center;gap:10px">
+        <button id="syncBtn" style="display:none" onclick="enterSyncMode()">⏱ Sync Timing</button>
+        <span id="lyricsCount" style="font-size:0.78rem;color:var(--muted)"></span>
+      </div>
     </div>
     <div id="lyricsList"></div>
   </div>
 
+</div>
+
+<!-- Sync timing overlay -->
+<div id="syncOverlay">
+  <div class="sync-progress" id="syncProgress">Line 1 of —</div>
+  <div class="sync-current"  id="syncCurrent"></div>
+  <div class="sync-next"     id="syncNext"></div>
+  <button class="sync-tap-btn" id="syncTapBtn" onclick="tapSync()">TAP</button>
+  <div class="sync-hint">Press <strong>Space</strong> or tap when this line starts singing</div>
+  <div class="sync-controls">
+    <button class="btn-ghost" onclick="undoTap()" id="syncUndoBtn">↩ Undo</button>
+    <button class="btn-ghost" onclick="exitSyncMode()">Cancel</button>
+  </div>
 </div>
 
 <!-- Word detail panel -->
@@ -417,7 +467,13 @@ function openSettings() {
 function closeSettings() { document.getElementById('settingsOverlay').classList.remove('open'); }
 function closeSettingsIfBg(e) { if (e.target === document.getElementById('settingsOverlay')) closeSettings(); }
 function updateBanner() { document.getElementById('noKeyBanner').style.display = getKey() ? 'none' : 'block'; }
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSettings(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeSettings(); exitSyncMode(); return; }
+  if (e.key === ' ' && document.getElementById('syncOverlay').classList.contains('open')) {
+    e.preventDefault();
+    tapSync();
+  }
+});
 updateBanner();
 
 // ── YouTube Player ────────────────────────────────────────────────────────────
@@ -785,6 +841,78 @@ let subtitles      = [];
 let currentLineIdx = -1;
 let activeTokenEl  = null;
 let videoMode      = false; // true when loaded from YouTube URL
+let hasRealSync    = false; // true when subtitles have real timestamps
+
+// ── Tap-to-sync ───────────────────────────────────────────────────────────────
+
+let syncIdx     = 0;
+let syncHistory = []; // stack of {idx, prevStart, prevEnd, prevPrevEnd}
+
+function enterSyncMode() {
+  if (!player?.getCurrentTime) {
+    alert('No video loaded — paste a YouTube URL first.');
+    return;
+  }
+  syncIdx = 0;
+  syncHistory = [];
+  updateSyncDisplay();
+  document.getElementById('syncOverlay').classList.add('open');
+  // Start playing if paused
+  try { if (player.getPlayerState() !== 1) player.playVideo(); } catch {}
+}
+
+function exitSyncMode() {
+  document.getElementById('syncOverlay').classList.remove('open');
+  // If at least one tap was recorded, the sync is usable
+  if (syncIdx > 0) {
+    hasRealSync = syncIdx >= subtitles.length;
+    document.getElementById('syncBtn').style.display = hasRealSync ? 'none' : '';
+  }
+}
+
+function tapSync() {
+  if (!player?.getCurrentTime || syncIdx >= subtitles.length) return;
+  const ms = Math.round(player.getCurrentTime() * 1000);
+
+  syncHistory.push({
+    idx:        syncIdx,
+    prevStart:  subtitles[syncIdx].startMs,
+    prevEnd:    subtitles[syncIdx].endMs,
+    prevPrevEnd: syncIdx > 0 ? subtitles[syncIdx - 1].endMs : null,
+  });
+
+  subtitles[syncIdx].startMs = ms;
+  if (syncIdx > 0) subtitles[syncIdx - 1].endMs = ms;
+
+  syncIdx++;
+
+  if (syncIdx >= subtitles.length) {
+    subtitles[subtitles.length - 1].endMs = ms + 8000;
+    hasRealSync = true;
+    exitSyncMode();
+    return;
+  }
+  updateSyncDisplay();
+}
+
+function undoTap() {
+  if (!syncHistory.length) return;
+  const s = syncHistory.pop();
+  subtitles[s.idx].startMs = s.prevStart;
+  subtitles[s.idx].endMs   = s.prevEnd;
+  if (s.idx > 0 && s.prevPrevEnd !== null) subtitles[s.idx - 1].endMs = s.prevPrevEnd;
+  syncIdx = s.idx;
+  updateSyncDisplay();
+}
+
+function updateSyncDisplay() {
+  const total = subtitles.length;
+  document.getElementById('syncProgress').textContent = `Line ${syncIdx + 1} of ${total}`;
+  document.getElementById('syncCurrent').textContent  = subtitles[syncIdx]?.text || '';
+  const nxt = subtitles[syncIdx + 1];
+  document.getElementById('syncNext').textContent     = nxt ? `Next: ${nxt.text}` : '(last line)';
+  document.getElementById('syncUndoBtn').disabled     = syncHistory.length === 0;
+}
 
 // ── Lyric line rendering ──────────────────────────────────────────────────────
 
@@ -1046,6 +1174,8 @@ async function loadVideo() {
   }
 
   videoMode = true;
+  // Captions from YouTube have real timestamps; description/comment don't
+  hasRealSync = (source === 'YouTube captions');
   setStatus(`Loaded ${subtitles.length} lines`, 'ok');
 
   const ci = document.getElementById('captionInfo');
@@ -1053,6 +1183,7 @@ async function loadVideo() {
   ci.innerHTML = `${subtitles.length} lines · <span class="warn">${source}</span>`;
 
   renderLyrics(subtitles);
+  document.getElementById('syncBtn').style.display = hasRealSync ? 'none' : '';
   btn.disabled = false;
 
   if (getKey()) preAnalyze(0, 5);
@@ -1096,9 +1227,12 @@ async function loadPasted() {
   });
 
   // Everything is in cache — render all at once
+  hasRealSync = false;
   renderLyrics(subtitles);
   subtitles.forEach((_, i) => renderLineTokens(i));
   setStatus(`${lines.length} lines ready`, 'ok');
+  // Show sync button if a YouTube video is also loaded
+  document.getElementById('syncBtn').style.display = player ? '' : 'none';
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────
