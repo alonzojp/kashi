@@ -1,0 +1,962 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kashi 歌詞 — Japanese Lyrics Analyzer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #0b0b10;
+      --surface: #14141c;
+      --border:  #22222e;
+      --border2: #2e2e3e;
+      --text:    #ddd8f0;
+      --muted:   #666;
+      --red:     #e05252;
+      --red-dim: #3d1a1a;
+    }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 32px 16px 80px;
+    }
+
+    /* ── Header ─────────────────────────────────────────── */
+    header {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 26px;
+      width: 100%;
+      max-width: 1200px;
+    }
+    .header-text { text-align: center; }
+    .header-text h1 { font-size: 1.9rem; font-weight: 700; color: #fff; }
+    .header-text h1 span { color: var(--red); }
+    .header-text p  { font-size: 0.85rem; color: var(--muted); margin-top: 5px; }
+
+    #settingsBtn {
+      position: absolute; right: 0;
+      background: transparent; border: 1px solid var(--border2);
+      border-radius: 8px; color: var(--muted); padding: 7px 10px;
+      cursor: pointer; font-size: 1rem;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    #settingsBtn:hover { color: var(--text); border-color: #555; }
+
+    /* ── Modal ──────────────────────────────────────────── */
+    #settingsOverlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.7); z-index: 100;
+      align-items: center; justify-content: center;
+    }
+    #settingsOverlay.open { display: flex; }
+    .modal {
+      background: var(--surface); border: 1px solid var(--border2);
+      border-radius: 16px; padding: 32px; max-width: 480px; width: 90%;
+    }
+    .modal h2 { font-size: 1.1rem; color: #fff; margin-bottom: 10px; }
+    .modal p  { font-size: 0.85rem; color: #888; line-height: 1.6; margin-bottom: 18px; }
+    .modal a  { color: var(--red); }
+    .modal input[type="password"] {
+      width: 100%; background: var(--bg); border: 1px solid var(--border2);
+      border-radius: 8px; color: var(--text); font-size: 0.9rem;
+      padding: 10px 12px; outline: none; margin-bottom: 12px; font-family: monospace;
+    }
+    .modal input:focus { border-color: var(--red); }
+    .modal-btns { display: flex; gap: 10px; justify-content: flex-end; }
+
+    /* ── Buttons ────────────────────────────────────────── */
+    .btn-primary {
+      background: var(--red); color: #fff; border: none;
+      border-radius: 8px; padding: 9px 22px; font-size: 0.88rem;
+      font-weight: 600; cursor: pointer; font-family: inherit;
+      transition: background 0.15s;
+    }
+    .btn-primary:hover { background: #c94444; }
+    .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn-ghost {
+      background: transparent; color: var(--muted);
+      border: 1px solid var(--border2); border-radius: 8px;
+      padding: 9px 18px; font-size: 0.88rem; cursor: pointer; font-family: inherit;
+    }
+    .btn-ghost:hover { color: var(--text); }
+
+    /* ── Labels ─────────────────────────────────────────── */
+    .lbl {
+      font-size: 0.67rem; font-weight: 700; letter-spacing: 0.12em;
+      text-transform: uppercase; color: var(--muted);
+    }
+
+    /* ── Input panel ────────────────────────────────────── */
+    #inputPanel {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 16px; padding: 24px 26px;
+      width: 100%; max-width: 860px; margin-bottom: 14px;
+    }
+    #inputPanel .lbl { display: block; margin-bottom: 12px; }
+
+    .url-row { display: flex; gap: 10px; }
+
+    #urlInput {
+      flex: 1; background: var(--bg); border: 1px solid var(--border2);
+      border-radius: 10px; color: var(--text); font-size: 0.95rem;
+      padding: 11px 14px; outline: none; font-family: inherit;
+      transition: border-color 0.2s;
+    }
+    #urlInput:focus { border-color: var(--red); }
+    #urlInput::placeholder { color: #2e2e3e; }
+
+    #loadBtn { padding: 11px 26px; font-size: 0.92rem; font-weight: 600; }
+
+    #loadStatus {
+      margin-top: 10px; font-size: 0.84rem; color: var(--muted); min-height: 1.3em;
+    }
+    #loadStatus.error { color: var(--red); }
+    #loadStatus.ok    { color: #5cb85c; }
+
+    /* Manual paste toggle */
+    #pasteToggle {
+      margin-top: 14px; padding-top: 14px;
+      border-top: 1px solid var(--border2);
+    }
+    #pasteToggleBtn {
+      background: none; border: none; color: var(--muted);
+      font-size: 0.82rem; cursor: pointer; font-family: inherit; padding: 0;
+      transition: color 0.15s;
+    }
+    #pasteToggleBtn:hover { color: var(--text); }
+    #pasteArea { display: none; margin-top: 12px; }
+    #pasteArea.open { display: block; }
+    #lyricsInput {
+      width: 100%; background: var(--bg); border: 1px solid var(--border2);
+      border-radius: 10px; color: var(--text); font-size: 0.95rem;
+      line-height: 1.6; padding: 12px 14px; resize: vertical;
+      min-height: 140px; outline: none; font-family: inherit;
+      transition: border-color 0.2s; margin-bottom: 10px;
+    }
+    #lyricsInput:focus { border-color: var(--red); }
+    #lyricsInput::placeholder { color: #2e2e3e; }
+
+    /* ── No-key banner ───────────────────────────────────── */
+    #noKeyBanner {
+      display: none; background: #1a1a10; border: 1px solid #3a3a10;
+      border-radius: 12px; padding: 14px 20px; font-size: 0.85rem;
+      color: #aaa880; width: 100%; max-width: 860px; margin-bottom: 14px;
+    }
+    #noKeyBanner a { color: #d4c840; cursor: pointer; }
+
+    /* ── Main split panel ───────────────────────────────── */
+    #mainPanel {
+      display: none; width: 100%; max-width: 1200px;
+      gap: 14px; align-items: flex-start;
+      flex-direction: row;
+    }
+
+    /* Video column */
+    #videoCol { flex: 0 0 44%; position: sticky; top: 16px; }
+
+    .video-wrapper {
+      position: relative; padding-bottom: 56.25%; height: 0;
+      border-radius: 12px; overflow: hidden; background: #000;
+    }
+    .video-wrapper iframe {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    }
+
+    #captionInfo {
+      margin-top: 10px; font-size: 0.78rem; color: var(--muted);
+      padding: 9px 14px; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 8px; line-height: 1.5;
+    }
+    #captionInfo .warn { color: #bba840; }
+
+    /* Lyrics column */
+    #lyricsCol {
+      flex: 1; max-height: calc(100vh - 100px); overflow-y: auto;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 16px; padding: 18px 20px;
+    }
+
+    #lyricsHeader {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 14px; padding-bottom: 12px;
+      border-bottom: 1px solid var(--border2);
+    }
+
+    /* Lyric lines */
+    .lyric-line {
+      padding: 9px 12px; border-radius: 10px; margin-bottom: 3px;
+      border-left: 3px solid transparent;
+      transition: background 0.15s, opacity 0.2s, border-color 0.2s;
+      cursor: pointer;
+    }
+    .lyric-line:hover { background: rgba(255,255,255,0.04); }
+    .lyric-line.active {
+      background: var(--red-dim); border-left-color: var(--red);
+    }
+    .lyric-line.past { opacity: 0.3; }
+
+    .line-jp {
+      font-size: 1.5rem; line-height: 3.2; color: #fff;
+      display: flex; flex-wrap: wrap; align-items: flex-end;
+      user-select: none;
+    }
+    .line-jp.plain {
+      display: block; line-height: 1.65; font-size: 1.3rem;
+      user-select: text;
+    }
+    .line-en {
+      font-size: 0.82rem; color: #777; font-style: italic;
+      margin-top: 1px; line-height: 1.4;
+    }
+    .line-loading {
+      font-size: 0.75rem; color: #555; margin-top: 4px;
+      display: flex; align-items: center; gap: 6px;
+    }
+
+    /* Tokens */
+    .sent-token {
+      display: inline-flex; align-items: flex-end;
+      padding: 2px 3px; border-radius: 5px; cursor: pointer;
+      transition: background 0.12s; border-bottom: 2px solid transparent;
+    }
+    .sent-token:hover { background: rgba(255,255,255,0.08); }
+    .sent-token.active { background: var(--red-dim); border-bottom-color: var(--red); }
+    .sent-token ruby rt { font-size: 0.5em; color: var(--red); text-align: center; }
+
+    /* ── Word detail panel ───────────────────────────────── */
+    #wordDetailPanel {
+      display: none; width: 100%; max-width: 1200px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 16px; padding: 22px 26px; margin-top: 12px;
+    }
+    .wd-inner { display: flex; align-items: flex-start; gap: 20px; }
+
+    .wd-left {
+      display: flex; flex-direction: column; align-items: flex-start;
+      min-width: 80px; flex-shrink: 0; gap: 6px;
+    }
+    .wd-jp   { font-size: 1.7rem; font-weight: 700; color: #fff; line-height: 1; }
+    .wd-jp ruby rt { font-size: 0.38em; color: var(--red); text-align: center; }
+    .wd-right { flex: 1; min-width: 0; }
+    .wd-row1 { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
+    .wd-furi { font-size: 0.85rem; color: var(--red); font-weight: 500; }
+    .wd-rom  { font-size: 0.85rem; color: #777; font-style: italic; }
+    .wd-sep  { color: var(--border2); }
+    .wd-pos  { font-size: 0.68rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+    .wd-def  { font-size: 0.92rem; color: #bbb; line-height: 1.5; margin-top: 4px; }
+    .wd-note { font-size: 0.8rem; color: #666; font-style: italic; margin-top: 4px; }
+    .wd-dict { font-size: 0.75rem; color: #555; margin-top: 2px; }
+    .wd-hint { color: #444; font-size: 0.85rem; padding: 8px 0; }
+
+    .speak-btn {
+      background: transparent; border: none; color: #555; cursor: pointer;
+      font-size: 0.88rem; padding: 2px 4px; border-radius: 4px;
+      transition: color 0.15s; line-height: 1;
+    }
+    .speak-btn:hover { color: #aaa; }
+
+    .jlpt-badge {
+      font-size: 0.6rem; font-weight: 800; letter-spacing: 0.08em;
+      padding: 2px 7px; border-radius: 4px;
+    }
+    .jlpt-N5 { background:#1a3d1a; color:#5cb85c; }
+    .jlpt-N4 { background:#1a3038; color:#5bc0de; }
+    .jlpt-N3 { background:#1a2a3d; color:#428bca; }
+    .jlpt-N2 { background:#2a1a3d; color:#9b59b6; }
+    .jlpt-N1 { background:var(--red-dim); color:var(--red); }
+
+    /* ── Spinner ────────────────────────────────────────── */
+    .spinner {
+      display: inline-block; width: 13px; height: 13px;
+      border: 2px solid var(--border2); border-top-color: var(--red);
+      border-radius: 50%; animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Responsive ─────────────────────────────────────── */
+    @media (max-width: 720px) {
+      #mainPanel { flex-direction: column; }
+      #videoCol { position: static; flex: none; width: 100%; }
+      #lyricsCol { max-height: 55vh; }
+    }
+
+    footer { margin-top: 32px; color: #333; font-size: 0.75rem; text-align: center; }
+    footer a { color: #555; text-decoration: none; }
+    footer a:hover { color: #888; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="header-text">
+    <h1>Kashi <span>歌詞</span></h1>
+    <p>Japanese music video lyrics analyzer — click any word for definitions</p>
+  </div>
+  <button id="settingsBtn" onclick="openSettings()">⚙</button>
+</header>
+
+<!-- Settings modal -->
+<div id="settingsOverlay" onclick="closeSettingsIfBg(event)">
+  <div class="modal">
+    <h2>Groq API Key</h2>
+    <p>
+      Word analysis uses <strong>Groq + Llama 3.3</strong> — free with 14,400 requests/day.<br><br>
+      Get a free key at <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>.
+      Your key is stored in your browser only — never sent anywhere except Groq.
+    </p>
+    <input type="password" id="keyInput" placeholder="gsk_..." autocomplete="off" />
+    <div class="modal-btns">
+      <button class="btn-ghost" onclick="closeSettings()">Cancel</button>
+      <button class="btn-primary" onclick="saveSettings()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- No-key banner -->
+<div id="noKeyBanner">
+  ⚠ No API key set. <a onclick="openSettings()">Add your free Groq key</a> to enable word definitions and furigana.
+</div>
+
+<!-- Input panel -->
+<div id="inputPanel">
+  <span class="lbl">YouTube URL</span>
+  <div class="url-row">
+    <input id="urlInput" type="url" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off" />
+    <button id="loadBtn" class="btn-primary" onclick="loadVideo()">Load</button>
+  </div>
+  <div id="loadStatus"></div>
+
+  <div id="pasteToggle">
+    <button id="pasteToggleBtn" onclick="togglePaste()">▸ No subtitles? Paste lyrics manually</button>
+    <div id="pasteArea">
+      <textarea id="lyricsInput" placeholder="Paste Japanese lyrics here, one line per line…" spellcheck="false"></textarea>
+      <div style="display:flex;gap:10px;align-items:center">
+        <button class="btn-primary" onclick="loadPasted()">Analyze Lyrics</button>
+        <span style="font-size:0.82rem;color:var(--muted)">Works without a YouTube URL</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Main split panel -->
+<div id="mainPanel">
+
+  <!-- Video column -->
+  <div id="videoCol">
+    <div class="video-wrapper">
+      <div id="ytplayer"></div>
+    </div>
+    <div id="captionInfo" style="display:none"></div>
+  </div>
+
+  <!-- Lyrics column -->
+  <div id="lyricsCol">
+    <div id="lyricsHeader">
+      <span class="lbl">Lyrics</span>
+      <span id="lyricsCount" style="font-size:0.78rem;color:var(--muted)"></span>
+    </div>
+    <div id="lyricsList"></div>
+  </div>
+
+</div>
+
+<!-- Word detail panel -->
+<div id="wordDetailPanel">
+  <div class="wd-inner">
+    <div class="wd-hint">Click any word in the lyrics above to see its reading and definition</div>
+  </div>
+</div>
+
+<footer>Powered by <a href="https://groq.com" target="_blank" rel="noopener">Groq</a> (Llama 3.3) &amp; YouTube</footer>
+
+<script>
+// ── API key management ────────────────────────────────────────────────────────
+
+const BUILT_IN_KEY = '__GROQ_API_KEY__';
+function getKey() {
+  return localStorage.getItem('groq_api_key')
+    || (BUILT_IN_KEY.startsWith('__') ? '' : BUILT_IN_KEY);
+}
+function saveSettings() {
+  const k = document.getElementById('keyInput').value.trim();
+  if (k) localStorage.setItem('groq_api_key', k); else localStorage.removeItem('groq_api_key');
+  closeSettings();
+  updateBanner();
+}
+function openSettings() {
+  document.getElementById('keyInput').value = localStorage.getItem('groq_api_key') || '';
+  document.getElementById('settingsOverlay').classList.add('open');
+}
+function closeSettings() { document.getElementById('settingsOverlay').classList.remove('open'); }
+function closeSettingsIfBg(e) { if (e.target === document.getElementById('settingsOverlay')) closeSettings(); }
+function updateBanner() { document.getElementById('noKeyBanner').style.display = getKey() ? 'none' : 'block'; }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSettings(); });
+updateBanner();
+
+// ── YouTube Player ────────────────────────────────────────────────────────────
+
+let player     = null;
+let ytReady    = false;
+let pendingId  = null;
+let syncTimer  = null;
+
+window.onYouTubeIframeAPIReady = function() {
+  ytReady = true;
+  if (pendingId) createPlayer(pendingId);
+};
+
+function createPlayer(videoId) {
+  if (!ytReady) { pendingId = videoId; return; }
+  if (player) { player.loadVideoById(videoId); return; }
+  player = new YT.Player('ytplayer', {
+    videoId,
+    playerVars: { rel: 0, modestbranding: 1 },
+    events: {
+      onStateChange(e) {
+        clearInterval(syncTimer);
+        if (e.data === YT.PlayerState.PLAYING) {
+          syncTimer = setInterval(syncTime, 200);
+        }
+      }
+    }
+  });
+}
+
+// ── URL / video ID parsing ────────────────────────────────────────────────────
+
+function extractVideoId(raw) {
+  const url = raw.trim();
+  try {
+    const u = new URL(url);
+    if (u.hostname.includes('youtu.be')) return u.pathname.slice(1).split(/[/?]/)[0];
+    if (u.hostname.includes('youtube.com')) {
+      const v = u.searchParams.get('v');
+      if (v) return v;
+      const m = u.pathname.match(/\/(?:embed|shorts|v)\/([A-Za-z0-9_-]{11})/);
+      if (m) return m[1];
+    }
+  } catch {}
+  const m = url.match(/[?&/](?:v=|embed\/|shorts\/|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+
+// ── Subtitle fetching ─────────────────────────────────────────────────────────
+
+async function fetchSubtitles(videoId) {
+  const langs   = ['ja', 'ja-JP'];
+  const proxies = [
+    u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  ];
+
+  for (const lang of langs) {
+    for (const proxy of proxies) {
+      // json3 format (preferred — has millisecond timestamps)
+      try {
+        const src = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=json3`;
+        const res = await fetch(proxy(src), { signal: AbortSignal.timeout(7000) });
+        if (!res.ok) continue;
+        const text = await res.text();
+        if (!text || text.trimStart().startsWith('<')) continue;
+        const data  = JSON.parse(text);
+        const lines = parseJson3(data);
+        if (lines.length > 1) return { lines, auto: lang === 'ja' };
+      } catch {}
+
+      // XML format (fallback)
+      try {
+        const src = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}`;
+        const res = await fetch(proxy(src), { signal: AbortSignal.timeout(7000) });
+        if (!res.ok) continue;
+        const text = await res.text();
+        const lines = parseXml(text);
+        if (lines.length > 1) return { lines, auto: true };
+      } catch {}
+    }
+  }
+  return null;
+}
+
+function parseJson3(data) {
+  if (!data?.events) return [];
+  const out = [];
+  for (const e of data.events) {
+    if (!e.segs || e.tStartMs === undefined) continue;
+    const text = e.segs.map(s => s.utf8 || '').join('').replace(/\n/g, ' ').trim();
+    if (!text) continue;
+    out.push({ startMs: e.tStartMs, endMs: e.tStartMs + (e.dDurationMs || 3000), text });
+  }
+  return out;
+}
+
+function parseXml(xml) {
+  const doc   = new DOMParser().parseFromString(xml, 'text/xml');
+  const nodes = doc.querySelectorAll('text');
+  const out   = [];
+  for (const n of nodes) {
+    const start = parseFloat(n.getAttribute('start') || '0') * 1000;
+    const dur   = parseFloat(n.getAttribute('dur')   || '3') * 1000;
+    const text  = n.textContent.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&#39;/g,"'").trim();
+    if (text) out.push({ startMs: start, endMs: start + dur, text });
+  }
+  return out;
+}
+
+// ── Groq analysis ─────────────────────────────────────────────────────────────
+
+const LYRIC_PROMPT = `Analyze the Japanese lyric line below. Return ONLY valid JSON — no markdown, no explanation.
+
+CRITICAL: token "reading" must be the pronunciation as spoken in context.
+Examples: 日 in 日本 = に, 日 alone or in 〜の日 = ひ, 人 in 大人 = と not じん.
+
+{
+  "translation": "natural English for this line",
+  "tokens": [
+    {
+      "surface": "word as written",
+      "reading": "hiragana reading as pronounced in context",
+      "furigana": "per-kanji bracket notation: 歌(うた)う, 始(はじ)めて, 東(とう)京(きょう). Plain kana if no kanji.",
+      "romaji": "Hepburn romaji",
+      "part_of_speech": "noun|verb|particle|adjective|adverb|conjunction|proper noun|auxiliary verb|na-adjective|i-adjective|interjection",
+      "dictionary_form": "base form",
+      "english": "concise meaning",
+      "jlpt": "N5|N4|N3|N2|N1|null",
+      "notes": ""
+    }
+  ]
+}
+
+Line: `;
+
+const lineCache = {};
+
+async function analyzeLine(idx) {
+  if (lineCache[idx]) return lineCache[idx];
+  if (!getKey() || !subtitles[idx]) return null;
+
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${getKey()}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        { role: 'system', content: 'You are a Japanese language expert. Respond only with valid JSON.' },
+        { role: 'user',   content: LYRIC_PROMPT + subtitles[idx].text }
+      ],
+      temperature: 0.1,
+      response_format: { type: 'json_object' }
+    })
+  });
+  if (!res.ok) throw new Error(`Groq ${res.status}`);
+  const data   = await res.json();
+  const result = JSON.parse(data.choices[0].message.content);
+  lineCache[idx] = result;
+  return result;
+}
+
+// Silently pre-analyze `count` lines starting from `fromIdx`
+async function preAnalyze(fromIdx, count = 4) {
+  if (!getKey()) return;
+  for (let i = fromIdx; i < Math.min(fromIdx + count, subtitles.length); i++) {
+    if (lineCache[i]) { renderLineTokens(i); continue; }
+    try {
+      await analyzeLine(i);
+      renderLineTokens(i);
+    } catch {}
+    await new Promise(r => setTimeout(r, 350));
+  }
+}
+
+// ── Render helpers ────────────────────────────────────────────────────────────
+
+const KANJI_RE = new RegExp('[' +
+  String.fromCodePoint(0x4e00) + '-' + String.fromCodePoint(0x9fff) +
+  String.fromCodePoint(0x3400) + '-' + String.fromCodePoint(0x4dbf) + ']');
+
+function looksLikeReading(s) {
+  return /^[぀-ゟ゠-ヿ\s・ー]+$/.test((s || '').trim());
+}
+
+function furiganaToRuby(text) {
+  if (!text) return '';
+  const cjk = String.fromCodePoint(0x4e00) + '-' + String.fromCodePoint(0x9fff)
+             + String.fromCodePoint(0x3400) + '-' + String.fromCodePoint(0x4dbf)
+             + String.fromCodePoint(0x3005) + String.fromCodePoint(0x3006);
+  const rubyRe  = new RegExp('([' + cjk + ']+)[\\(（]([^)）]+)[\\)）]', 'g');
+  const stripRe = new RegExp('[\\(（][^)）]+[\\)）]', 'g');
+  let out = text.replace(rubyRe, '<ruby>$1<rt>$2</rt></ruby>');
+  return out.replace(stripRe, '');
+}
+
+function alignFurigana(surface, reading) {
+  if (!reading || reading === surface || !KANJI_RE.test(surface)) return null;
+  let si = surface.length - 1, ri = reading.length - 1;
+  while (si > 0 && ri > 0 && surface[si] === reading[ri] && /[ぁ-んァ-ン]/.test(surface[si])) {
+    si--; ri--;
+  }
+  const kanjiPart  = surface.slice(0, si + 1);
+  const kanaSuffix = surface.slice(si + 1);
+  const kanjiRead  = reading.slice(0, ri + 1);
+  if (!kanjiPart || !kanjiRead || kanjiRead === kanjiPart) return null;
+  return kanjiPart + '(' + kanjiRead + ')' + kanaSuffix;
+}
+
+function buildRubyHTML(surface, reading, furigana) {
+  if (!KANJI_RE.test(surface)) return null;
+  const furi = furigana || alignFurigana(surface, reading);
+  if (furi) return furiganaToRuby(furi);
+  if (reading && reading !== surface) return '<ruby>' + surface + '<rt>' + reading + '</rt></ruby>';
+  return null;
+}
+
+function toRomaji(s) {
+  if (!s) return '';
+  s = s.replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
+  const C = {'きゃ':'kya','きゅ':'kyu','きょ':'kyo','しゃ':'sha','しゅ':'shu','しょ':'sho','ちゃ':'cha','ちゅ':'chu','ちょ':'cho','にゃ':'nya','にゅ':'nyu','にょ':'nyo','ひゃ':'hya','ひゅ':'hyu','ひょ':'hyo','みゃ':'mya','みゅ':'myu','みょ':'myo','りゃ':'rya','りゅ':'ryu','りょ':'ryo','ぎゃ':'gya','ぎゅ':'gyu','ぎょ':'gyo','じゃ':'ja','じゅ':'ju','じょ':'jo','びゃ':'bya','びゅ':'byu','びょ':'byo','ぴゃ':'pya','ぴゅ':'pyu','ぴょ':'pyo','ふぁ':'fa','ふぃ':'fi','ふぇ':'fe','ふぉ':'fo'};
+  const S = {'あ':'a','い':'i','う':'u','え':'e','お':'o','か':'ka','き':'ki','く':'ku','け':'ke','こ':'ko','さ':'sa','し':'shi','す':'su','せ':'se','そ':'so','た':'ta','ち':'chi','つ':'tsu','て':'te','と':'to','な':'na','に':'ni','ぬ':'nu','ね':'ne','の':'no','は':'ha','ひ':'hi','ふ':'fu','へ':'he','ほ':'ho','ま':'ma','み':'mi','む':'mu','め':'me','も':'mo','や':'ya','ゆ':'yu','よ':'yo','ら':'ra','り':'ri','る':'ru','れ':'re','ろ':'ro','わ':'wa','を':'wo','ん':'n','が':'ga','ぎ':'gi','ぐ':'gu','げ':'ge','ご':'go','ざ':'za','じ':'ji','ず':'zu','ぜ':'ze','ぞ':'zo','だ':'da','ぢ':'ji','づ':'zu','で':'de','ど':'do','ば':'ba','び':'bi','ぶ':'bu','べ':'be','ぼ':'bo','ぱ':'pa','ぴ':'pi','ぷ':'pu','ぺ':'pe','ぽ':'po','ゃ':'ya','ゅ':'yu','ょ':'yo','ー':'-'};
+  let out = '', i = 0;
+  while (i < s.length) {
+    if (s[i] === 'っ') { const p = C[s.slice(i+1,i+3)]||S[s[i+1]]||''; out += p[0]||''; i++; continue; }
+    const two = s.slice(i,i+2);
+    if (C[two]) { out += C[two]; i+=2; } else if (S[s[i]]) { out += S[s[i]]; i++; } else { out += s[i]; i++; }
+  }
+  return out;
+}
+
+function speakText(text) {
+  if (!window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'ja-JP'; u.rate = 0.85;
+  window.speechSynthesis.speak(u);
+}
+
+function makeBadge(jlpt) {
+  if (!jlpt) return null;
+  const el = document.createElement('span');
+  el.className = `jlpt-badge jlpt-${jlpt}`;
+  el.textContent = jlpt;
+  return el;
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+let subtitles      = [];
+let currentLineIdx = -1;
+let activeTokenEl  = null;
+let videoMode      = false; // true when loaded from YouTube URL
+
+// ── Lyric line rendering ──────────────────────────────────────────────────────
+
+function renderLyrics(lines) {
+  const container = document.getElementById('lyricsList');
+  container.innerHTML = '';
+  lines.forEach((line, idx) => {
+    const div = document.createElement('div');
+    div.className = 'lyric-line';
+    div.dataset.idx = idx;
+
+    const jp = document.createElement('div');
+    jp.className = 'line-jp plain';
+    jp.textContent = line.text;
+    div.appendChild(jp);
+
+    div.addEventListener('click', () => onLineClick(idx));
+    container.appendChild(div);
+  });
+  document.getElementById('lyricsCount').textContent = `${lines.length} lines`;
+}
+
+function renderLineTokens(idx) {
+  const result = lineCache[idx];
+  if (!result) return;
+
+  const lineEl = document.querySelector(`.lyric-line[data-idx="${idx}"]`);
+  if (!lineEl) return;
+
+  // Replace plain text with interactive tokens
+  const jp = lineEl.querySelector('.line-jp');
+  if (!jp || !jp.classList.contains('plain')) return; // already rendered
+  jp.className = 'line-jp';
+  jp.innerHTML = '';
+
+  (result.tokens || []).forEach(token => {
+    const span    = document.createElement('span');
+    span.className = 'sent-token';
+
+    const surface  = token.surface || '';
+    const reading  = (token.reading && token.reading !== surface) ? token.reading : '';
+    const rubyHtml = reading ? buildRubyHTML(surface, reading, token.furigana) : null;
+
+    if (rubyHtml) {
+      const tmp = document.createElement('span');
+      tmp.innerHTML = rubyHtml;
+      while (tmp.firstChild) span.appendChild(tmp.firstChild);
+    } else {
+      span.textContent = surface;
+    }
+
+    span.addEventListener('click', e => { e.stopPropagation(); selectToken(token, span); });
+    jp.appendChild(span);
+  });
+
+  // Remove loading indicator if present
+  const loading = lineEl.querySelector('.line-loading');
+  if (loading) loading.remove();
+
+  // Add English translation
+  if (result.translation && !lineEl.querySelector('.line-en')) {
+    const en = document.createElement('div');
+    en.className = 'line-en';
+    en.textContent = result.translation;
+    lineEl.appendChild(en);
+  }
+}
+
+// ── Word detail card ──────────────────────────────────────────────────────────
+
+function selectToken(token, spanEl) {
+  if (activeTokenEl) activeTokenEl.classList.remove('active');
+  activeTokenEl = spanEl;
+  spanEl.classList.add('active');
+
+  const surface = token.surface || '';
+  const reading = (token.reading && token.reading !== surface) ? token.reading : '';
+  const romaji  = token.romaji || toRomaji(token.reading || '');
+  const def     = (token.english && !looksLikeReading(token.english)) ? token.english : '';
+
+  const panel = document.getElementById('wordDetailPanel');
+  panel.style.display = 'block';
+
+  const inner = panel.querySelector('.wd-inner');
+  inner.innerHTML = '';
+
+  const left  = document.createElement('div'); left.className  = 'wd-left';
+  const right = document.createElement('div'); right.className = 'wd-right';
+
+  // Large word with ruby
+  const jpEl     = document.createElement('div'); jpEl.className = 'wd-jp';
+  const rubyHtml = reading ? buildRubyHTML(surface, reading, token.furigana) : null;
+  if (rubyHtml) { jpEl.innerHTML = rubyHtml; jpEl.style.lineHeight = '2.4'; }
+  else          { jpEl.textContent = surface; }
+
+  const spk = document.createElement('button'); spk.className = 'speak-btn'; spk.textContent = '🔊';
+  spk.addEventListener('click', e => { e.stopPropagation(); speakText(surface); });
+  left.appendChild(jpEl); left.appendChild(spk);
+
+  // Reading · romaji · JLPT
+  const row1 = document.createElement('div'); row1.className = 'wd-row1';
+  if (reading && !KANJI_RE.test(surface)) {
+    const f = document.createElement('span'); f.className='wd-furi'; f.textContent=reading; row1.appendChild(f);
+    const sep = document.createElement('span'); sep.className='wd-sep'; sep.textContent='·'; row1.appendChild(sep);
+  }
+  if (romaji && romaji !== surface) {
+    const r = document.createElement('span'); r.className='wd-rom'; r.textContent=romaji; row1.appendChild(r);
+  }
+  const badge = makeBadge(token.jlpt);
+  if (badge) row1.appendChild(badge);
+  right.appendChild(row1);
+
+  if (token.part_of_speech) {
+    const p = document.createElement('div'); p.className='wd-pos'; p.textContent=token.part_of_speech; right.appendChild(p);
+  }
+  if (token.dictionary_form && token.dictionary_form !== surface) {
+    const d = document.createElement('div'); d.className='wd-dict'; d.textContent='dict: '+token.dictionary_form; right.appendChild(d);
+  }
+  if (def) {
+    const e = document.createElement('div'); e.className='wd-def'; e.textContent=def; right.appendChild(e);
+  }
+  if (token.notes) {
+    const n = document.createElement('div'); n.className='wd-note'; n.textContent=token.notes; right.appendChild(n);
+  }
+
+  inner.appendChild(left); inner.appendChild(right);
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+// ── Time sync ─────────────────────────────────────────────────────────────────
+
+function syncTime() {
+  if (!player?.getCurrentTime) return;
+  const ms = player.getCurrentTime() * 1000;
+
+  // Find the last line whose start time is <= current time
+  let idx = -1;
+  for (let i = 0; i < subtitles.length; i++) {
+    if (subtitles[i].startMs <= ms) idx = i; else break;
+  }
+  // If found line has ended (and a gap exists), clear highlight
+  if (idx >= 0 && subtitles[idx].endMs < ms - 200) idx = -1;
+
+  if (idx === currentLineIdx) return;
+  currentLineIdx = idx;
+  applyHighlight();
+
+  // Pre-analyze upcoming lines
+  if (idx >= 0) preAnalyze(idx, 4);
+}
+
+function applyHighlight() {
+  document.querySelectorAll('.lyric-line').forEach((el, i) => {
+    el.classList.toggle('active', i === currentLineIdx);
+    el.classList.toggle('past',   i < currentLineIdx);
+  });
+  if (currentLineIdx >= 0) scrollLineIntoView(currentLineIdx);
+}
+
+function scrollLineIntoView(idx) {
+  const container = document.getElementById('lyricsCol');
+  const el = document.querySelector(`.lyric-line[data-idx="${idx}"]`);
+  if (!el || !container) return;
+  const cRect = container.getBoundingClientRect();
+  const eRect = el.getBoundingClientRect();
+  const offset = eRect.top - cRect.top - cRect.height / 2 + eRect.height / 2;
+  container.scrollBy({ top: offset, behavior: 'smooth' });
+}
+
+// ── Click on line (on-demand analysis) ───────────────────────────────────────
+
+async function onLineClick(idx) {
+  if (lineCache[idx]) return; // already analyzed and rendered
+  if (!getKey()) { openSettings(); return; }
+
+  const lineEl = document.querySelector(`.lyric-line[data-idx="${idx}"]`);
+  if (!lineEl) return;
+
+  let loading = lineEl.querySelector('.line-loading');
+  if (!loading) {
+    loading = document.createElement('div');
+    loading.className = 'line-loading';
+    loading.innerHTML = 'Analyzing <span class="spinner"></span>';
+    lineEl.appendChild(loading);
+  }
+
+  try {
+    await analyzeLine(idx);
+    renderLineTokens(idx);
+  } catch {
+    if (loading) loading.textContent = 'Analysis failed — try again';
+  }
+}
+
+// ── Show main panel ───────────────────────────────────────────────────────────
+
+function showMainPanel(withVideo) {
+  const panel = document.getElementById('mainPanel');
+  panel.style.display = 'flex';
+  document.getElementById('videoCol').style.display = withVideo ? '' : 'none';
+}
+
+// ── Load from YouTube URL ─────────────────────────────────────────────────────
+
+async function loadVideo() {
+  const url = document.getElementById('urlInput').value.trim();
+  if (!url) return;
+
+  const videoId = extractVideoId(url);
+  if (!videoId) { setStatus('Could not read a video ID from that URL.', 'error'); return; }
+
+  const btn = document.getElementById('loadBtn');
+  btn.disabled = true;
+  setStatus('Fetching Japanese subtitles…');
+
+  subtitles      = [];
+  currentLineIdx = -1;
+  lineCache      && Object.keys(lineCache).forEach(k => delete lineCache[k]);
+
+  showMainPanel(true);
+  createPlayer(videoId);
+
+  const result = await fetchSubtitles(videoId);
+
+  if (!result || !result.lines.length) {
+    setStatus('No Japanese subtitles found for this video.', 'error');
+    const ci = document.getElementById('captionInfo');
+    ci.style.display = 'block';
+    ci.innerHTML = 'No Japanese captions found. Try pasting the lyrics manually below.';
+    btn.disabled = false;
+    return;
+  }
+
+  subtitles  = result.lines;
+  videoMode  = true;
+  setStatus(`Loaded ${subtitles.length} lines`, 'ok');
+
+  const ci = document.getElementById('captionInfo');
+  ci.style.display = 'block';
+  ci.innerHTML = `${subtitles.length} lines`
+    + (result.auto ? ' · <span class="warn">⚠ Auto-generated captions — accuracy may vary for music</span>' : ' · manual captions');
+
+  renderLyrics(subtitles);
+  btn.disabled = false;
+
+  if (getKey()) preAnalyze(0, 5);
+}
+
+// ── Load from pasted lyrics ───────────────────────────────────────────────────
+
+function loadPasted() {
+  const raw = document.getElementById('lyricsInput').value.trim();
+  if (!raw) return;
+
+  const lines = raw.split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 0)
+    .map((text, i) => ({ startMs: i * 5000, endMs: (i + 1) * 5000, text }));
+
+  if (!lines.length) return;
+
+  subtitles      = lines;
+  currentLineIdx = -1;
+  lineCache      && Object.keys(lineCache).forEach(k => delete lineCache[k]);
+  videoMode      = false;
+
+  showMainPanel(false);
+  renderLyrics(subtitles);
+  setStatus(`Loaded ${lines.length} lines`, 'ok');
+
+  if (getKey()) preAnalyze(0, 6);
+}
+
+// ── Status ────────────────────────────────────────────────────────────────────
+
+function setStatus(msg, type = '') {
+  const el = document.getElementById('loadStatus');
+  el.textContent = msg;
+  el.className   = type;
+}
+
+// ── Paste toggle ──────────────────────────────────────────────────────────────
+
+function togglePaste() {
+  const area = document.getElementById('pasteArea');
+  const btn  = document.getElementById('pasteToggleBtn');
+  const open = area.classList.toggle('open');
+  btn.textContent = open
+    ? '▾ No subtitles? Paste lyrics manually'
+    : '▸ No subtitles? Paste lyrics manually';
+}
+
+// ── Enter key on URL input ────────────────────────────────────────────────────
+
+document.getElementById('urlInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') loadVideo();
+});
+</script>
+
+<!-- YouTube iframe API — must load after the script above defines onYouTubeIframeAPIReady -->
+<script src="https://www.youtube.com/iframe_api" async></script>
+
+</body>
+</html>
