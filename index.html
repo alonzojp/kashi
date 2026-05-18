@@ -224,6 +224,10 @@
       font-size: 0.75rem; color: #555; margin-top: 4px;
       display: flex; align-items: center; gap: 6px;
     }
+    .analyzing-msg {
+      display: flex; align-items: center; gap: 12px;
+      color: var(--muted); font-size: 0.9rem; padding: 28px 4px;
+    }
 
     /* Tokens */
     .sent-token {
@@ -688,14 +692,15 @@ async function preAnalyze(fromIdx, count = 4) {
   }
 }
 
-// Analyze all lines at once in parallel batches of 3 (used for pasted lyrics)
-async function analyzeAll() {
+// Analyze all lines in parallel batches of 3, filling the cache only (no rendering)
+async function analyzeAll(onProgress) {
   if (!getKey() || !subtitles.length) return;
   const indices = subtitles.map((_, i) => i).filter(i => !lineCache[i]);
+  let done = 0;
   for (let i = 0; i < indices.length; i += 3) {
     await Promise.allSettled(
       indices.slice(i, i + 3).map(idx =>
-        analyzeLine(idx).then(() => renderLineTokens(idx)).catch(() => {})
+        analyzeLine(idx).then(() => { done++; onProgress?.(done, indices.length); }).catch(() => { done++; onProgress?.(done, indices.length); })
       )
     );
     if (i + 3 < indices.length) await new Promise(r => setTimeout(r, 250));
@@ -1055,7 +1060,7 @@ async function loadVideo() {
 
 // ── Load from pasted lyrics ───────────────────────────────────────────────────
 
-function loadPasted() {
+async function loadPasted() {
   const raw = document.getElementById('lyricsInput').value.trim();
   if (!raw) return;
 
@@ -1068,14 +1073,32 @@ function loadPasted() {
 
   subtitles      = lines;
   currentLineIdx = -1;
-  lineCache      && Object.keys(lineCache).forEach(k => delete lineCache[k]);
+  Object.keys(lineCache).forEach(k => delete lineCache[k]);
   videoMode      = false;
 
   showMainPanel(false);
-  renderLyrics(subtitles);
-  setStatus(`Loaded ${lines.length} lines`, 'ok');
 
-  if (getKey()) analyzeAll();
+  if (!getKey()) {
+    renderLyrics(subtitles);
+    setStatus(`Loaded ${lines.length} lines — add a Groq key for analysis`, 'ok');
+    return;
+  }
+
+  // Show a loading state while everything analyzes
+  document.getElementById('lyricsCount').textContent = '';
+  const list = document.getElementById('lyricsList');
+  list.innerHTML = `<div class="analyzing-msg"><span class="spinner"></span><span id="analyzeProgress">Analyzing 0 / ${lines.length} lines…</span></div>`;
+  setStatus('Analyzing all lines…');
+
+  await analyzeAll((done, total) => {
+    const el = document.getElementById('analyzeProgress');
+    if (el) el.textContent = `Analyzing ${done} / ${total} lines…`;
+  });
+
+  // Everything is in cache — render all at once
+  renderLyrics(subtitles);
+  subtitles.forEach((_, i) => renderLineTokens(i));
+  setStatus(`${lines.length} lines ready`, 'ok');
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────
