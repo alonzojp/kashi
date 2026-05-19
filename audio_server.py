@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kashi audio server — downloads YouTube audio and aligns lyrics with accurate timestamps.
+Kashi audio server — captions, audio, and lyric alignment via yt-dlp.
 
 Setup (one time):
     pip install yt-dlp faster-whisper
@@ -8,223 +8,196 @@ Setup (one time):
 Run:
     python audio_server.py
 
-Keep this window open while using Kashi.
-
 Endpoints:
-  GET  /?v=VIDEO_ID          — streams audio (fallback, rarely used directly)
-  POST /align                — full pipeline: download → transcribe → align → LRC timestamps
+  GET  /captions?v=ID    — download YouTube captions (yt-dlp) → JSON timestamps
+  GET  /?v=ID            — stream audio for Whisper fallback
+  POST /align            — download + transcribe + align → JSON timestamps
 """
 
-import gc
-import json
-import os
-import re
-import subprocess
-import sys
-import tempfile
-import unicodedata
+import json, os, re, subprocess, sys, tempfile, unicodedata
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
 PORT = 7755
 
-# ---------------------------------------------------------------------------
-# Optional faster-whisper (local, no rate limits, uses lyrics as prompt)
-# ---------------------------------------------------------------------------
+# ── Optional faster-whisper ──────────────────────────────────────────────────
 try:
     from faster_whisper import WhisperModel
-    _whisper_model = None          # loaded lazily on first /align request
+    _whisper_model = None
     HAS_FASTER_WHISPER = True
-    print("faster-whisper found — will use local transcription.")
+    print("faster-whisper available — Whisper alignment enabled.")
 except ImportError:
     HAS_FASTER_WHISPER = False
-    print("faster-whisper not found — will use Groq API for transcription.")
-    print("  For better accuracy:  pip install faster-whisper")
+    print("faster-whisper not found (pip install faster-whisper for Whisper fallback).")
 
 
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
-        print("  Loading Whisper model (first run — downloads ~300 MB)…")
+        print("  Loading Whisper model (~300 MB, first run only)…")
         _whisper_model = WhisperModel("medium", device="cpu", compute_type="int8")
         print("  Model ready.")
     return _whisper_model
 
 
-# ---------------------------------------------------------------------------
-# Audio download
-# ---------------------------------------------------------------------------
+# ── Caption fetching via yt-dlp ──────────────────────────────────────────────
 
-def download_audio(video_id: str, out_path: str):
-    """Download best audio to out_path using yt-dlp."""
+def fetch_captions(video_id):
+    """
+    Download Japanese captions for a YouTube video using yt-dlp.
+    Returns (lines, source) where lines = [{text, startMs, endMs}]
+    and source is 'manual' | 'asr' | None.
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = os.path.join(tmpdir, "%(id)s.%(ext)s")
+        subprocess.run(
+            ["yt-dlp",
+             "--write-sub", "--write-auto-sub",
+             "--sub-lang", "ja",
+             "--sub-format", "json3",
+             "--skip-download", "--no-playlist",
+             "-o", out, url],
+            capture_output=True, timeout=45, check=False,
+        )
+        files = os.listdir(tmpdir)
+        # Manual captions first, then auto-generated
+        ordered = (
+            [f for f in files if f.endswith(".json3") and ".auto." not in f.lower()] +
+            [f for f in files if f.endswith(".json3") and ".auto." in f.lower()]
+        )
+        for fname in ordered:
+            is_auto = ".auto." in fname.lower()
+            try:
+                with open(os.path.join(tmpdir, fname), encoding="utf-8") as fp:
+                    data = json.load(fp)
+                lines = parse_json3(data)
+                if lines:
+                    print(f"    yt-dlp captions: {len(lines)} lines ({'asr' if is_auto else 'manual'})")
+                    return lines, "asr" if is_auto else "manual"
+            except Exception as e:
+                print(f"    parse error {fname}: {e}")
+    return None, None
+
+
+def parse_json3(data):
+    """Parse yt-dlp's json3 caption format into line dicts."""
+    lines = []
+    for ev in data.get("events", []):
+        segs = ev.get("segs", [])
+        text = "".join(s.get("utf8", "") for s in segs).replace("\n", " ").strip()
+        if not text:
+            continue
+        start = int(ev.get("tStartMs", 0))
+        dur   = int(ev.get("dDurationMs", 3000))
+        lines.append({"text": text, "startMs": start, "endMs": start + dur})
+    return lines or None
+
+
+# ── Audio download ────────────────────────────────────────────────────────────
+
+def download_audio(video_id, out_path):
     subprocess.run(
-        [
-            "yt-dlp",
-            "-f", "bestaudio/best",
-            "--extract-audio",
-            "--audio-format", "mp3",
-            "--audio-quality", "5",
-            "--no-playlist",
-            "-o", out_path,
-            f"https://www.youtube.com/watch?v={video_id}",
-        ],
-        check=True,
-        capture_output=True,
+        ["yt-dlp", "-f", "bestaudio/best", "--extract-audio",
+         "--audio-format", "mp3", "--audio-quality", "5",
+         "--no-playlist", "-o", out_path,
+         f"https://www.youtube.com/watch?v={video_id}"],
+        check=True, capture_output=True,
     )
 
 
-# ---------------------------------------------------------------------------
-# Transcription
-# ---------------------------------------------------------------------------
+# ── Transcription ─────────────────────────────────────────────────────────────
 
-def transcribe_local(audio_path: str, lyrics_lines: list) -> list:
-    """
-    Transcribe with faster-whisper using lyrics as initial prompt.
-    Returns list of {word, start, end} dicts.
-    """
-    model = get_whisper_model()
-    prompt = "\n".join(lyrics_lines[:30])[:500]   # guide model with known text
-
-    segments, _ = model.transcribe(
-        audio_path,
-        language="ja",
-        word_timestamps=True,
-        initial_prompt=prompt,
-        beam_size=5,
-        vad_filter=True,          # skip silent / non-speech sections
+def transcribe_local(audio_path, lyrics_lines):
+    model  = get_whisper_model()
+    prompt = "\n".join(lyrics_lines[:30])[:500]
+    segs, _ = model.transcribe(
+        audio_path, language="ja", word_timestamps=True,
+        initial_prompt=prompt, beam_size=5, vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 500},
     )
-
     words = []
-    for seg in segments:
+    for seg in segs:
         for w in (seg.words or []):
             words.append({"word": w.word, "start": float(w.start), "end": float(w.end)})
     return words
 
 
-def transcribe_groq(audio_path: str, lyrics_lines: list, groq_key: str) -> list:
-    """Fallback: Groq Whisper API — returns list of {word, start, end}."""
+def transcribe_groq(audio_path, lyrics_lines, groq_key):
     import urllib.request
-
-    prompt = "\n".join(lyrics_lines[:8])[:224]
-
+    prompt   = "\n".join(lyrics_lines[:8])[:224]
     boundary = "----KashiBoundary"
     with open(audio_path, "rb") as f:
         audio_data = f.read()
 
     def field(name, value):
-        return (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
-            f"{value}\r\n"
-        ).encode()
+        return (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").encode()
 
     body = (
-        field("model", "whisper-large-v3")
-        + field("language", "ja")
-        + field("response_format", "verbose_json")
-        + field("timestamp_granularities[]", "word")
-        + field("timestamp_granularities[]", "segment")
-        + (field("prompt", prompt) if prompt else b"")
-        + (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="audio.mp3"\r\n'
-            f"Content-Type: audio/mpeg\r\n\r\n"
-        ).encode()
-        + audio_data
-        + f"\r\n--{boundary}--\r\n".encode()
+        field("model",  "whisper-large-v3") +
+        field("language", "ja") +
+        field("response_format", "verbose_json") +
+        field("timestamp_granularities[]", "word") +
+        field("timestamp_granularities[]", "segment") +
+        (field("prompt", prompt) if prompt else b"") +
+        (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n").encode() +
+        audio_data +
+        f"\r\n--{boundary}--\r\n".encode()
     )
-
     req = urllib.request.Request(
-        "https://api.groq.com/openai/v1/audio/transcriptions",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {groq_key}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        },
+        "https://api.groq.com/openai/v1/audio/transcriptions", data=body,
+        headers={"Authorization": f"Bearer {groq_key}",
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
     with urllib.request.urlopen(req, timeout=180) as resp:
-        result = json.loads(resp.read())
-
-    return result.get("words") or []
+        return json.loads(resp.read()).get("words") or []
 
 
-# ---------------------------------------------------------------------------
-# Alignment
-# ---------------------------------------------------------------------------
+# ── Alignment ─────────────────────────────────────────────────────────────────
 
-def normalize(text: str) -> str:
-    """Normalize Japanese text to hiragana + ASCII for comparison."""
+def normalize(text):
     text = unicodedata.normalize("NFKC", text or "")
-    out = []
+    out  = []
     for c in text:
         cp = ord(c)
-        if 0x30A1 <= cp <= 0x30F6:          # katakana → hiragana
-            out.append(chr(cp - 0x60))
-        else:
-            out.append(c)
-    text = "".join(out).lower()
-    text = re.sub(r"[^぀-ゟ一-鿿㐀-䶿a-z0-9]", "", text)
-    return text
+        out.append(chr(cp - 0x60) if 0x30A1 <= cp <= 0x30F6 else c)
+    return re.sub(r"[^぀-ゟ一-鿿㐀-䶿a-z0-9]", "", "".join(out).lower())
 
 
-def align(lyrics_lines: list, words: list) -> list:
-    """
-    Map each lyric line to a timestamp from the Whisper word list.
-
-    Strategy:
-      1. Build a normalized concatenation of Whisper words with position→word index map.
-      2. For each lyric line try prefix matches (longest→shortest) against the
-         normalized transcript, always advancing the search cursor forward.
-      3. Collect anchor points (line_idx, start_ms).
-      4. Interpolate or extrapolate for unmatched lines so every line has a
-         unique, monotonically increasing timestamp.
-    """
+def align(lyrics_lines, words):
     if not words or not lyrics_lines:
         n = len(lyrics_lines)
         return [{"startMs": i * 4000, "endMs": (i + 1) * 4000} for i in range(n)]
 
-    # Build normalized transcript string
     norm_words = [{"norm": normalize(w.get("word", "")), "start": w["start"]} for w in words]
     norm_words = [w for w in norm_words if w["norm"]]
-
-    full = "".join(w["norm"] for w in norm_words)
-    pos_to_word = []                       # char position → word index
+    full       = "".join(w["norm"] for w in norm_words)
+    pos2word   = []
     for wi, w in enumerate(norm_words):
-        pos_to_word.extend([wi] * len(w["norm"]))
+        pos2word.extend([wi] * len(w["norm"]))
 
-    # ── Anchor pass ──────────────────────────────────────────────────────────
-    anchors = []   # list of (line_idx, start_ms)
-    cursor = 0
-
+    anchors = []
+    cursor  = 0
     for li, line in enumerate(lyrics_lines):
         norm = normalize(line)
         if not norm:
             continue
-        found = False
         for plen in range(min(len(norm), 12), 1, -1):
             idx = full.find(norm[:plen], cursor)
             if idx < 0:
                 continue
-            wi = pos_to_word[idx] if idx < len(pos_to_word) else 0
-            start_ms = round(norm_words[wi]["start"] * 1000)
-            anchors.append((li, start_ms))
+            wi = pos2word[idx] if idx < len(pos2word) else 0
+            anchors.append((li, round(norm_words[wi]["start"] * 1000)))
             cursor = idx + 1
-            found = True
             break
 
     if not anchors:
-        # No anchors at all — distribute evenly across the audio duration
-        total_ms = round(words[-1]["end"] * 1000) if words else len(lyrics_lines) * 4000
-        n = len(lyrics_lines)
-        return [
-            {"startMs": round(i * total_ms / n), "endMs": round((i + 1) * total_ms / n)}
-            for i in range(n)
-        ]
+        total = round(words[-1]["end"] * 1000) if words else len(lyrics_lines) * 4000
+        n     = len(lyrics_lines)
+        return [{"startMs": round(i * total / n), "endMs": round((i + 1) * total / n)} for i in range(n)]
 
-    # ── Assign raw timestamps ─────────────────────────────────────────────────
-    n = len(lyrics_lines)
-    raw = [None] * n
+    n     = len(lyrics_lines)
+    raw   = [None] * n
     for li, ms in anchors:
         raw[li] = ms
 
@@ -235,40 +208,29 @@ def align(lyrics_lines: list, words: list) -> list:
         if span_li > 0:
             avg_ms = span_ms / span_li
 
-    # Before first anchor: proportional from 0 → first anchor time
     first_li, first_ms = anchors[0]
     for i in range(first_li):
         raw[i] = round((i / first_li) * first_ms) if first_li > 0 else 0
 
-    # Between anchors: linear interpolation
     for k in range(len(anchors) - 1):
         a_li, a_ms = anchors[k]
         b_li, b_ms = anchors[k + 1]
         for i in range(a_li + 1, b_li):
-            t = (i - a_li) / (b_li - a_li)
-            raw[i] = round(a_ms + t * (b_ms - a_ms))
+            raw[i] = round(a_ms + ((i - a_li) / (b_li - a_li)) * (b_ms - a_ms))
 
-    # After last anchor: linear extrapolation
     last_li, last_ms = anchors[-1]
     for i in range(last_li + 1, n):
         raw[i] = round(last_ms + (i - last_li) * avg_ms)
 
-    # Enforce strict monotonicity with minimum 300 ms gap
     for i in range(1, n):
         if raw[i] is None or raw[i] <= raw[i - 1]:
             raw[i] = raw[i - 1] + 300
 
-    # Build result
-    result = []
-    for i, ms in enumerate(raw):
-        end = raw[i + 1] if i + 1 < n else ms + 8000
-        result.append({"startMs": ms, "endMs": end})
-    return result
+    return [{"startMs": raw[i], "endMs": raw[i + 1] if i + 1 < n else raw[i] + 8000}
+            for i in range(n)]
 
 
-# ---------------------------------------------------------------------------
-# HTTP handler
-# ---------------------------------------------------------------------------
+# ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -280,18 +242,30 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def do_OPTIONS(self):
-        self.send_response(200)
-        self.cors()
-        self.end_headers()
+        self.send_response(200); self.cors(); self.end_headers()
 
-    # ── GET /?v=ID  →  stream audio ──────────────────────────────────────────
+    # ── GET /captions?v=ID  →  caption lines with timestamps ─────────────────
+    # ── GET /?v=ID           →  stream audio ─────────────────────────────────
     def do_GET(self):
-        params = parse_qs(urlparse(self.path).query)
+        parsed   = urlparse(self.path)
+        params   = parse_qs(parsed.query)
         video_id = params.get("v", [""])[0]
-        if not video_id:
-            self._err(400, "Missing ?v=VIDEO_ID")
+
+        if parsed.path == "/captions":
+            if not video_id:
+                return self._json(400, {"error": "Missing ?v=VIDEO_ID"})
+            print(f"  /captions {video_id}")
+            try:
+                lines, source = fetch_captions(video_id)
+                self._json(200, {"lines": lines or [], "source": source or "none"})
+            except Exception as e:
+                print(f"  caption error: {e}")
+                self._json(500, {"error": str(e), "lines": [], "source": "error"})
             return
 
+        # Audio stream
+        if not video_id:
+            return self._err(400, "Missing ?v=VIDEO_ID")
         print(f"  Streaming audio for {video_id}…")
         try:
             proc = subprocess.Popen(
@@ -301,8 +275,7 @@ class Handler(BaseHTTPRequestHandler):
                  f"https://www.youtube.com/watch?v={video_id}"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
-            self.send_response(200)
-            self.cors()
+            self.send_response(200); self.cors()
             self.send_header("Content-Type", "audio/mpeg")
             self.end_headers()
             while chunk := proc.stdout.read(65536):
@@ -311,106 +284,85 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
         except Exception as e:
-            print(f"  Audio error: {e}")
+            print(f"  audio error: {e}")
 
     # ── POST /align  →  JSON timestamps ──────────────────────────────────────
     def do_POST(self):
         if urlparse(self.path).path != "/align":
-            self._err(404, "Not found")
-            return
-
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length))
-
-        video_id  = body.get("videoId", "")
-        lyrics    = body.get("lyrics", [])     # list of lyric line strings
-        groq_key  = body.get("groqKey", "")
-
+            return self._err(404, "Not found")
+        length   = int(self.headers.get("Content-Length", 0))
+        body     = json.loads(self.rfile.read(length))
+        video_id = body.get("videoId", "")
+        lyrics   = body.get("lyrics", [])
+        groq_key = body.get("groqKey", "")
         if not video_id or not lyrics:
-            self._err(400, "videoId and lyrics required")
-            return
+            return self._err(400, "videoId and lyrics required")
 
-        print(f"  Aligning {len(lyrics)} lines for {video_id}…")
-
+        print(f"  /align {video_id} ({len(lyrics)} lines)")
         try:
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 audio_path = f.name
-
             try:
-                # 1. Download audio
                 print("    Downloading audio…")
                 download_audio(video_id, audio_path)
-
-                # 2. Transcribe
                 if HAS_FASTER_WHISPER:
-                    print("    Transcribing (local faster-whisper)…")
+                    print("    Transcribing (faster-whisper)…")
                     whisper_words = transcribe_local(audio_path, lyrics)
                 elif groq_key:
-                    print("    Transcribing (Groq API)…")
+                    print("    Transcribing (Groq)…")
                     whisper_words = transcribe_groq(audio_path, lyrics, groq_key)
                 else:
-                    self._err(400, "No groqKey provided and faster-whisper not installed")
-                    return
-
-                print(f"    Got {len(whisper_words)} words from Whisper.")
-
-                # 3. Align
-                print("    Aligning…")
+                    return self._err(400, "No groqKey and faster-whisper not installed")
+                print(f"    {len(whisper_words)} words → aligning…")
                 timestamps = align(lyrics, whisper_words)
-
             finally:
-                try:
-                    os.unlink(audio_path)
-                except OSError:
-                    pass
+                try: os.unlink(audio_path)
+                except OSError: pass
 
-            # 4. Return JSON
             payload = json.dumps({"timestamps": timestamps}).encode()
-            self.send_response(200)
-            self.cors()
+            self.send_response(200); self.cors()
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
-            print(f"    Done — {len(timestamps)} lines aligned.")
+            print(f"    Done.")
 
         except subprocess.CalledProcessError as e:
-            msg = e.stderr.decode(errors="replace") if e.stderr else str(e)
-            print(f"  yt-dlp error: {msg}")
+            msg = (e.stderr or b"").decode(errors="replace")
+            print(f"  yt-dlp error: {msg[:200]}")
             self._err(500, f"yt-dlp failed: {msg[:200]}")
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
             self._err(500, str(e))
 
-    def _err(self, code, msg):
-        body = json.dumps({"error": msg}).encode()
-        self.send_response(code)
-        self.cors()
+    def _json(self, code, data):
+        body = json.dumps(data).encode()
+        self.send_response(code); self.cors()
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def _err(self, code, msg):
+        self._json(code, {"error": msg})
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     try:
         subprocess.run(["yt-dlp", "--version"], capture_output=True, check=True)
     except FileNotFoundError:
-        print("yt-dlp not found.  Install:  pip install yt-dlp")
-        sys.exit(1)
+        print("yt-dlp not found.  Install:  pip install yt-dlp"); sys.exit(1)
 
-    print(f"\nKashi audio server on http://localhost:{PORT}")
+    print(f"\nKashi audio server  http://localhost:{PORT}")
+    print("  /captions  — yt-dlp caption download (primary timing source)")
+    print("  /align     — Whisper forced alignment (fallback)")
     if HAS_FASTER_WHISPER:
-        print("Mode: local faster-whisper (accurate, offline)")
+        print("  Transcription: local faster-whisper")
     else:
-        print("Mode: Groq API (requires key in Kashi settings)")
-        print("  Upgrade:  pip install faster-whisper")
-    print("Press Ctrl+C to stop.\n")
+        print("  Transcription: Groq API  (pip install faster-whisper for local)")
+    print("\nPress Ctrl+C to stop.\n")
 
     try:
         HTTPServer(("localhost", PORT), Handler).serve_forever()

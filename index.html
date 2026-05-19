@@ -1596,9 +1596,24 @@ async function loadVideo() {
   let source = '';
 
   try {
-    // ── 1. YouTube captions ───────────────────────────────
-    setProgress('Fetching YouTube page…');
-    const page = await fetchYouTubePage(videoId);
+    // ── 0. yt-dlp captions via local server (most reliable) ──
+    setProgress('Fetching captions…');
+    try {
+      const capRes = await fetch(`http://localhost:7755/captions?v=${videoId}`,
+        { signal: AbortSignal.timeout(30000) });
+      if (capRes.ok) {
+        const cap = await capRes.json();
+        if (cap.lines?.length > 1) {
+          subtitles   = cap.lines;
+          hasRealSync = true;
+          source      = cap.source === 'manual' ? 'YouTube captions' : 'Auto-generated captions';
+          setServerBanner(false);
+        }
+      }
+    } catch {}
+
+    // ── 1. Page-scrape captions (fallback when server not running) ──
+    const page = !subtitles.length ? await fetchYouTubePage(videoId) : null;
 
     if (page) {
       setProgress('Scanning for Japanese captions…');
