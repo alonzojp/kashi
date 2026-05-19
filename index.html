@@ -523,7 +523,7 @@ function extractVideoId(raw) {
   return m ? m[1] : null;
 }
 
-// ── Subtitle fetching ─────────────────────────────────────────────────────────
+// ── Subtitle / page fetching ──────────────────────────────────────────────────
 
 // corsproxy.io expects the URL unencoded; allorigins needs it encoded
 const PROXIES = [
@@ -531,80 +531,73 @@ const PROXIES = [
   u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
 ];
 
-async function fetchSubtitles(videoId) {
+// Fetch the YouTube watch page once and extract both captions and description
+async function fetchYouTubePage(videoId) {
   for (const proxy of PROXIES) {
-    // Step 1: list available caption tracks so we know exact lang codes / kinds
-    const tracks = await listTracks(videoId, proxy);
-
-    // Prefer manual Japanese tracks, then ASR (auto-generated)
-    const jaTracks = tracks.filter(t => t.lang.startsWith('ja'));
-    const ordered  = [
-      ...jaTracks.filter(t => t.kind !== 'asr'),
-      ...jaTracks.filter(t => t.kind === 'asr'),
-    ];
-
-    // If no tracks listed, fall back to trying common codes directly
-    if (!ordered.length) {
-      for (const lang of ['ja', 'ja-JP']) {
-        for (const kind of ['', 'asr']) {
-          const r = await tryFetchTrack(videoId, { lang, kind, name: '' }, proxy);
-          if (r) return r;
-        }
-      }
-    }
-
-    for (const track of ordered) {
-      const r = await tryFetchTrack(videoId, track, proxy);
-      if (r) return r;
-    }
+    try {
+      const res = await fetch(proxy(`https://www.youtube.com/watch?v=${videoId}`), {
+        signal: AbortSignal.timeout(12000)
+      });
+      if (!res.ok) continue;
+      const html = await res.text();
+      if (!html.includes('ytInitialPlayerResponse')) continue;
+      return { html, proxy };
+    } catch {}
   }
   return null;
 }
 
-async function listTracks(videoId, proxy) {
-  try {
-    const url = `https://www.youtube.com/api/timedtext?v=${videoId}&type=list`;
-    const res = await fetch(proxy(url), { signal: AbortSignal.timeout(6000) });
-    if (!res.ok) return [];
-    const xml = await res.text();
-    const doc = new DOMParser().parseFromString(xml, 'text/xml');
-    const out = [];
-    doc.querySelectorAll('track').forEach(t => out.push({
-      lang: t.getAttribute('lang_code') || '',
-      name: t.getAttribute('name')      || '',
-      kind: t.getAttribute('kind')      || '',
-    }));
-    return out;
-  } catch { return []; }
+// Extract signed timedtext URLs that YouTube embeds in its own page HTML.
+// These are far more reliable than guessing parameters — they're the exact
+// URLs YouTube's player uses internally, with all necessary auth tokens.
+async function captionsFromPageHtml(html, proxy) {
+  // The page JSON stores URLs like: "baseUrl":"https:\/\/www.youtube.com\/api\/timedtext?..."
+  const re = /"baseUrl":"(https:\\\/\\\/www\.youtube\.com\\\/api\\\/timedtext[^"]+)"/g;
+  let m;
+  const jaUrls = [];
+  while ((m = re.exec(html)) !== null) {
+    const url = m[1]
+      .replace(/\\\//g, '/')
+      .replace(/\\u0026/g, '&')
+      .replace(/\\u003d/g, '=')
+      .replace(/\\u003c/g, '<')
+      .replace(/\\u003e/g, '>');
+    if (/[?&]lang=ja/.test(url)) jaUrls.push(url);
+  }
+  if (!jaUrls.length) return null;
+
+  // Manual captions first, then ASR
+  jaUrls.sort((a, b) => (a.includes('kind=asr') ? 1 : 0) - (b.includes('kind=asr') ? 1 : 0));
+
+  for (const url of jaUrls) {
+    const jsonUrl = url.replace(/&fmt=[^&]*/g, '') + '&fmt=json3';
+    try {
+      const r = await fetch(proxy(jsonUrl), { signal: AbortSignal.timeout(8000) });
+      if (!r.ok) continue;
+      const text = await r.text();
+      if (!text || text.trimStart().startsWith('<')) continue;
+      const lines = parseJson3(JSON.parse(text));
+      if (lines.length > 1) return { lines, auto: url.includes('kind=asr') };
+    } catch {}
+    // xml fallback for this url
+    try {
+      const r = await fetch(proxy(url.replace(/&fmt=[^&]*/g, '')), { signal: AbortSignal.timeout(8000) });
+      if (r.ok) {
+        const lines = parseXml(await r.text());
+        if (lines.length > 1) return { lines, auto: true };
+      }
+    } catch {}
+  }
+  return null;
 }
 
-async function tryFetchTrack(videoId, track, proxy) {
-  const base = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${track.lang}`;
-  const extra = (track.name ? `&name=${encodeURIComponent(track.name)}` : '')
-              + (track.kind ? `&kind=${track.kind}` : '');
-  const isAsr = track.kind === 'asr';
-
-  // Try json3 first (has millisecond timestamps)
-  try {
-    const res = await fetch(proxy(base + extra + '&fmt=json3'), { signal: AbortSignal.timeout(7000) });
-    if (res.ok) {
-      const text = await res.text();
-      if (text && !text.trimStart().startsWith('<')) {
-        const lines = parseJson3(JSON.parse(text));
-        if (lines.length > 1) return { lines, auto: isAsr };
-      }
-    }
-  } catch {}
-
-  // XML fallback
-  try {
-    const res = await fetch(proxy(base + extra), { signal: AbortSignal.timeout(7000) });
-    if (res.ok) {
-      const lines = parseXml(await res.text());
-      if (lines.length > 1) return { lines, auto: true };
-    }
-  } catch {}
-
+async function fetchSubtitles(videoId) {
+  // Fetch the page once — gets us signed caption URLs AND the description
+  const page = await fetchYouTubePage(videoId);
+  if (page) {
+    const result = await captionsFromPageHtml(page.html, page.proxy);
+    if (result) return result;
+  }
   return null;
 }
 
@@ -644,14 +637,14 @@ function extractJapaneseLines(text) {
     .map((t, i) => ({ startMs: i * 5000, endMs: (i + 1) * 5000, text: t }));
 }
 
-async function fetchFromDescription(videoId) {
-  for (const proxy of PROXIES) {
+async function fetchFromDescription(videoId, cachedPage) {
+  const pages = cachedPage ? [cachedPage] : [];
+  if (!pages.length) {
+    const p = await fetchYouTubePage(videoId);
+    if (p) pages.push(p);
+  }
+  for (const { html } of pages) {
     try {
-      const res = await fetch(proxy(`https://www.youtube.com/watch?v=${videoId}`), {
-        signal: AbortSignal.timeout(10000)
-      });
-      if (!res.ok) continue;
-      const html = await res.text();
       // shortDescription is embedded in ytInitialPlayerResponse as a JSON string value
       const m = html.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/);
       if (!m) continue;
@@ -1135,23 +1128,24 @@ async function loadVideo() {
   showMainPanel(true);
   createPlayer(videoId);
 
-  // 1. Try YouTube captions
-  setStatus('Checking YouTube captions…');
-  const result = await fetchSubtitles(videoId);
+  // 1 + 2. Fetch the YouTube page once — try captions first, then description
+  setStatus('Loading YouTube page…');
+  const page = await fetchYouTubePage(videoId);
   let source = '';
 
-  if (result?.lines.length) {
-    subtitles = result.lines;
-    source = result.auto
-      ? '⚠ Auto-generated captions — accuracy may vary for music'
-      : 'YouTube captions';
-  }
+  if (page) {
+    setStatus('Scanning for Japanese captions…');
+    const captionResult = await captionsFromPageHtml(page.html, page.proxy);
+    if (captionResult?.lines.length) {
+      subtitles = captionResult.lines;
+      source = captionResult.auto ? '⚠ Auto-generated captions' : 'YouTube captions';
+    }
 
-  // 2. Try description
-  if (!subtitles.length) {
-    setStatus('No captions — scanning description…');
-    const descLines = await fetchFromDescription(videoId);
-    if (descLines?.length > 2) { subtitles = descLines; source = 'Lyrics from description'; }
+    if (!subtitles.length) {
+      setStatus('No captions — checking description…');
+      const descLines = await fetchFromDescription(videoId, page);
+      if (descLines?.length > 2) { subtitles = descLines; source = 'Lyrics from description'; }
+    }
   }
 
   // 3. Try pinned/top comment (requires YouTube API key)
