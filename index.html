@@ -827,63 +827,21 @@ async function preAnalyze(fromIdx, count = 4) {
   }
 }
 
-// Send up to 15 lines in one request, get back an array of results.
-async function analyzeBatch(indices) {
-  if (!indices.length) return;
-  const lines = indices.map(i => subtitles[i].text);
-
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${getKey()}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages: [
-            { role: 'system', content: 'You are a Japanese language expert. Respond only with valid JSON.' },
-            { role: 'user', content:
-`Analyze every Japanese lyric line listed below. Return ONLY this JSON — no markdown, no explanation:
-{"results":[{"translation":"natural English","tokens":[{"surface":"as written","reading":"hiragana as spoken in context","furigana":"per-kanji e.g. 食(た)べる","romaji":"hepburn","part_of_speech":"noun|verb|particle|adjective|adverb|conjunction|proper noun|auxiliary verb|na-adjective|i-adjective|interjection","dictionary_form":"base form","english":"meaning","jlpt":"N5|N4|N3|N2|N1|null","notes":""}]}]}
-
-Rules:
-- Return exactly ${lines.length} objects in "results", one per line, same order.
-- "reading" = pronunciation as actually spoken (e.g. 日 in 日本 = に, 人 in 大人 = と).
-
-Lines:
-${lines.map((l, i) => `${i + 1}. ${l}`).join('\n')}` }
-          ],
-          temperature: 0.1,
-          max_tokens: 8192,
-          response_format: { type: 'json_object' },
-        }),
-        signal: AbortSignal.timeout(90000),
-      });
-
-      if (res.status === 429) { await new Promise(r => setTimeout(r, 8000 * (attempt + 1))); continue; }
-      if (!res.ok) throw new Error(`Groq ${res.status}`);
-
-      const parsed = JSON.parse((await res.json()).choices[0].message.content);
-      const results = parsed.results || parsed.analyses || parsed.lines || [];
-      results.forEach((r, k) => { if (k < indices.length && r) lineCache[indices[k]] = r; });
-      return;
-    } catch (e) {
-      if (attempt < 2) continue;
-    }
-  }
-}
-
-// Analyze all lines in as few requests as possible (batches of 15).
+// Analyze all lines — 3 concurrent requests at a time, no artificial delay.
+// Small individual responses (100-200 tokens each) are faster than one giant
+// batch because the model generates them in parallel and Groq is token-bound.
 async function analyzeAll(onProgress) {
   if (!getKey() || !subtitles.length) return;
   const indices = subtitles.map((_, i) => i).filter(i => !lineCache[i]);
-  if (!indices.length) return;
-  const BATCH = 15;
   let done = 0;
-  for (let i = 0; i < indices.length; i += BATCH) {
-    const batch = indices.slice(i, i + BATCH);
-    try { await analyzeBatch(batch); } catch {}
-    done += batch.length;
-    onProgress?.(done, indices.length);
+  for (let i = 0; i < indices.length; i += 3) {
+    await Promise.allSettled(
+      indices.slice(i, i + 3).map(idx =>
+        analyzeLine(idx)
+          .then(() => { done++; onProgress?.(done, indices.length); })
+          .catch(() => { done++; onProgress?.(done, indices.length); })
+      )
+    );
   }
 }
 
