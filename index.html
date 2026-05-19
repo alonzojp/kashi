@@ -880,6 +880,32 @@ function setSyncButtons() {
 
 // ── Auto sync (Cobalt → Groq Whisper → align) ────────────────────────────────
 
+// Core sync logic — callable both from the button and from loadVideo().
+// onProgress(msg) is called with status strings; throws on failure.
+async function runAutoSync(videoId, onProgress) {
+  onProgress('Downloading audio…');
+  const audioBlob = await fetchAudioViaCobalt(videoId);
+
+  onProgress('Transcribing with Whisper…');
+  const prompt = subtitles.slice(0, 8).map(s => s.text).join('\n');
+  const result = await transcribeWithWhisper(audioBlob, prompt);
+
+  onProgress('Aligning lyrics to audio…');
+  const words = result.words    || [];
+  const segs  = result.segments || [];
+
+  // Try word-level first; fall back to DTW on segments
+  const wordOk = words.length > 0 && alignByWords(words);
+  if (!wordOk) {
+    if (segs.length > 0) alignByDTW(segs);
+    else throw new Error('Whisper returned no timing data');
+  }
+
+  hasRealSync = true;
+  setSyncButtons();
+}
+
+// Button handler
 async function autoSync() {
   if (!getKey()) { openSettings(); return; }
   const videoId = extractVideoId(document.getElementById('urlInput').value.trim());
@@ -889,29 +915,17 @@ async function autoSync() {
   btn.disabled = true;
 
   try {
-    btn.textContent = '⚡ Getting audio…';
-    const audioBlob = await fetchAudioViaCobalt(videoId);
-
-    btn.textContent = '⚡ Transcribing…';
-    const prompt = subtitles.slice(0, 8).map(s => s.text).join('\n');
-    const result = await transcribeWithWhisper(audioBlob, prompt);
-
-    btn.textContent = '⚡ Aligning…';
-    const words = result.words || [];
-    const segs  = result.segments || [];
-    if (words.length)     alignByWords(words);
-    else if (segs.length) alignBySegments(segs);
-    else throw new Error('Whisper returned no timing data');
-
-    hasRealSync = true;
+    await runAutoSync(videoId, msg => {
+      btn.textContent = `⚡ ${msg}`;
+      setStatus(msg);
+    });
     btn.style.display = 'none';
     document.getElementById('syncBtn').style.display = 'none';
-    setStatus('Lyrics timed automatically', 'ok');
-
+    setStatus(`${subtitles.length} lines ready — auto-timed`, 'ok');
   } catch (err) {
     btn.disabled = false;
     btn.textContent = '⚡ Auto Sync';
-    setStatus(`Auto sync failed: ${err.message} — use Manual Sync instead.`, 'error');
+    setStatus(`Auto sync failed: ${err.message}`, 'error');
   }
 }
 
@@ -961,43 +975,112 @@ async function transcribeWithWhisper(blob, prompt) {
   return await res.json();
 }
 
-// Align by matching the first few characters of each lyric line to Whisper words
-function alignByWords(words) {
-  if (!words.length || !subtitles.length) return;
-  const fullText   = words.map(w => (w.word || '').replace(/\s/g, '')).join('');
-  const charToWord = [];
-  let pos = 0;
-  words.forEach((w, wi) => {
-    (w.word || '').replace(/\s/g, '').split('').forEach(() => { charToWord[pos++] = wi; });
-  });
-
-  let searchFrom = 0;
-  subtitles.forEach(line => {
-    const query = line.text.replace(/\s/g, '').slice(0, 6);
-    if (!query) return;
-    const idx = fullText.indexOf(query, searchFrom);
-    if (idx < 0) return;
-    const wi  = charToWord[idx] ?? 0;
-    line.startMs  = Math.round((words[wi].start ?? 0) * 1000);
-    line.endMs    = Math.round((words[Math.min(wi + 4, words.length - 1)].end ?? words[wi].start + 3) * 1000);
-    searchFrom    = idx + 1;
-  });
-
-  // Each line's end = next line's start
-  for (let i = 0; i < subtitles.length - 1; i++) {
-    if (subtitles[i + 1].startMs > 0) subtitles[i].endMs = subtitles[i + 1].startMs;
-  }
+// Normalize Japanese text for comparison — converts katakana→hiragana,
+// fullwidth→ascii, strips punctuation so Whisper variants still match lyrics
+function normalizeForAlign(s) {
+  return (s || '')
+    .replace(/\s/g, '')
+    .replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60))
+    .replace(/[！-～]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .toLowerCase()
+    .replace(/[^぀-ゟ一-鿿㐀-䶿a-z0-9]/g, '');
 }
 
-// Fallback: distribute lines proportionally across Whisper segments
-function alignBySegments(segs) {
-  if (!segs.length || !subtitles.length) return;
-  subtitles.forEach((line, i) => {
-    const t   = subtitles.length > 1 ? i / (subtitles.length - 1) : 0;
-    const seg = segs[Math.min(Math.floor(t * segs.length), segs.length - 1)];
-    line.startMs = Math.round((seg.start ?? 0) * 1000);
-    line.endMs   = Math.round((seg.end   ?? seg.start + 3) * 1000);
+// Word-level alignment: normalized character matching with variable-length prefix.
+// Returns true if ≥40% of lines were anchored.
+function alignByWords(words) {
+  if (!words.length || !subtitles.length) return false;
+
+  const normWords = words
+    .map(w => ({ norm: normalizeForAlign(w.word || ''), start: w.start ?? 0, end: w.end ?? ((w.start ?? 0) + 0.5) }))
+    .filter(w => w.norm.length > 0);
+
+  const fullNorm  = normWords.map(w => w.norm).join('');
+  const posToWord = [];
+  let p = 0;
+  normWords.forEach((w, wi) => { for (let k = 0; k < w.norm.length; k++) posToWord[p++] = wi; });
+
+  let searchFrom = 0;
+  let matched    = 0;
+
+  subtitles.forEach(line => {
+    const norm = normalizeForAlign(line.text);
+    if (!norm) return;
+    // Try prefix lengths longest→shortest for robustness
+    for (let len = Math.min(norm.length, 10); len >= 2; len--) {
+      const idx = fullNorm.indexOf(norm.slice(0, len), searchFrom);
+      if (idx < 0) continue;
+      const wi       = posToWord[idx] ?? 0;
+      line.startMs   = Math.round(normWords[wi].start * 1000);
+      line.endMs     = line.startMs + 5000; // fixed up below
+      searchFrom     = idx + 1;
+      matched++;
+      break;
+    }
   });
+
+  // Fix end times: each line ends when the next begins
+  for (let i = 0; i < subtitles.length - 1; i++) {
+    if (subtitles[i + 1].startMs > subtitles[i].startMs)
+      subtitles[i].endMs = subtitles[i + 1].startMs;
+  }
+  const last = subtitles[subtitles.length - 1];
+  if (last && last.endMs <= last.startMs) last.endMs = last.startMs + 8000;
+
+  return matched >= subtitles.length * 0.4;
+}
+
+// DTW alignment: uses dynamic programming to map N lyric lines to M Whisper
+// segments by minimising normalised text-length difference as a cost proxy.
+// Much more robust than proportional distribution when segment count varies.
+function alignByDTW(segs) {
+  if (!segs.length || !subtitles.length) return;
+  const n = subtitles.length, m = segs.length;
+
+  const cost = (i, j) => {
+    const lLen = normalizeForAlign(subtitles[i].text).length || 1;
+    const sLen = normalizeForAlign(segs[j].text || '').length || 1;
+    return Math.abs(lLen - sLen) / Math.max(lLen, sLen);
+  };
+
+  // Build DP table
+  const INF  = 1e9;
+  const dp   = Array.from({length: n}, (_, i) => Array.from({length: m}, (_, j) => INF));
+  const prev = Array.from({length: n}, () => Array(m).fill(null));
+
+  dp[0][0] = cost(0, 0);
+  for (let j = 1; j < m; j++) { dp[0][j] = dp[0][j-1] + cost(0, j); prev[0][j] = [0, j-1]; }
+  for (let i = 1; i < n; i++) { dp[i][0] = dp[i-1][0] + cost(i, 0); prev[i][0] = [i-1, 0]; }
+  for (let i = 1; i < n; i++) {
+    for (let j = 1; j < m; j++) {
+      const opts = [[dp[i-1][j-1],[i-1,j-1]], [dp[i-1][j],[i-1,j]], [dp[i][j-1],[i,j-1]]];
+      const best = opts.reduce((a, b) => b[0] < a[0] ? b : a);
+      dp[i][j]   = cost(i, j) + best[0];
+      prev[i][j] = best[1];
+    }
+  }
+
+  // Backtrack to get lyric→segment mapping
+  const segForLine = new Array(n);
+  let i = n-1, j = m-1;
+  while (i >= 0) {
+    if (segForLine[i] === undefined) segForLine[i] = j;
+    const p = prev[i][j];
+    if (!p) break;
+    [i, j] = p;
+  }
+
+  subtitles.forEach((line, li) => {
+    const si  = segForLine[li] ?? Math.floor(li * m / n);
+    const seg = segs[Math.min(si, m-1)];
+    line.startMs = Math.round((seg.start ?? 0) * 1000);
+    line.endMs   = Math.round((seg.end   ?? (seg.start ?? 0) + 4) * 1000);
+  });
+
+  for (let k = 0; k < subtitles.length - 1; k++) {
+    if (subtitles[k+1].startMs > subtitles[k].startMs)
+      subtitles[k].endMs = subtitles[k+1].startMs;
+  }
 }
 
 // ── Tap-to-sync ───────────────────────────────────────────────────────────────
@@ -1377,6 +1460,17 @@ async function loadVideo() {
     if (getKey()) {
       setProgress(`Analyzing 0 / ${subtitles.length} lines…`);
       await analyzeAll((done, total) => setProgress(`Analyzing ${done} / ${total} lines…`));
+    }
+
+    // ── 5b. Auto-sync timing when no real timestamps ──────
+    if (!hasRealSync && getKey()) {
+      try {
+        await runAutoSync(videoId, msg => setProgress(`⏱ ${msg}`));
+      } catch (err) {
+        // Non-fatal — lyrics still display, just without highlighting sync
+        setProgress(`Timing unavailable (${err.message}) — showing lyrics only`);
+        await new Promise(r => setTimeout(r, 1500));
+      }
     }
 
     // ── 6. Render everything at once ──────────────────────
