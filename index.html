@@ -1523,9 +1523,9 @@ async function searchLrcLib(query, artist = '') {
   const jaRe = /[぀-鿿一-鿿]/;
   const pickBest = results => {
     if (!Array.isArray(results) || !results.length) return null;
-    return results.find(r => jaRe.test(r.syncedLyrics  || '') && r.syncedLyrics)
-        || results.find(r => jaRe.test(r.plainLyrics   || '') && (r.syncedLyrics || r.plainLyrics))
-        || (results[0]?.syncedLyrics || results[0]?.plainLyrics ? results[0] : null);
+    const withJa = results.filter(r => jaRe.test(r.syncedLyrics || r.plainLyrics || ''));
+    if (!withJa.length) return null;
+    return withJa.find(r => r.syncedLyrics) || withJa[0];
   };
 
   // Try artist + track first for a tighter match
