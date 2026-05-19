@@ -1068,12 +1068,14 @@ function normalizeForAlign(s) {
 }
 
 // Word-level alignment: normalized character matching with variable-length prefix.
-// Returns true if ≥40% of lines were anchored.
+// Unmatched lines are interpolated between neighbouring anchor points so no
+// line is left at a fake placeholder timestamp.
+// Returns true if ≥30% of lines were directly anchored.
 function alignByWords(words) {
   if (!words.length || !subtitles.length) return false;
 
   const normWords = words
-    .map(w => ({ norm: normalizeForAlign(w.word || ''), start: w.start ?? 0, end: w.end ?? ((w.start ?? 0) + 0.5) }))
+    .map(w => ({ norm: normalizeForAlign(w.word || ''), start: w.start ?? 0 }))
     .filter(w => w.norm.length > 0);
 
   const fullNorm  = normWords.map(w => w.norm).join('');
@@ -1081,41 +1083,70 @@ function alignByWords(words) {
   let p = 0;
   normWords.forEach((w, wi) => { for (let k = 0; k < w.norm.length; k++) posToWord[p++] = wi; });
 
+  // ── Pass 1: collect anchors ────────────────────────────────────────────────
+  const anchors = []; // { lineIdx, startMs }
   let searchFrom = 0;
-  let matched    = 0;
 
-  subtitles.forEach(line => {
+  subtitles.forEach((line, lineIdx) => {
     const norm = normalizeForAlign(line.text);
     if (!norm) return;
-    // Try prefix lengths longest→shortest for robustness
     for (let len = Math.min(norm.length, 10); len >= 2; len--) {
       const idx = fullNorm.indexOf(norm.slice(0, len), searchFrom);
       if (idx < 0) continue;
-      const wi       = posToWord[idx] ?? 0;
-      line.startMs   = Math.round(normWords[wi].start * 1000);
-      line.endMs     = line.startMs + 5000; // fixed up below
-      searchFrom     = idx + 1;
-      matched++;
+      const wi = posToWord[idx] ?? 0;
+      anchors.push({ lineIdx, startMs: Math.round(normWords[wi].start * 1000) });
+      searchFrom = idx + 1;
       break;
     }
   });
 
-  // Fix end times: each line ends when the next begins
-  for (let i = 0; i < subtitles.length - 1; i++) {
-    if (subtitles[i + 1].startMs > subtitles[i].startMs)
-      subtitles[i].endMs = subtitles[i + 1].startMs;
-  }
-  const last = subtitles[subtitles.length - 1];
-  if (last && last.endMs <= last.startMs) last.endMs = last.startMs + 8000;
+  if (anchors.length < subtitles.length * 0.3) return false;
 
-  return matched >= subtitles.length * 0.4;
+  // ── Pass 2: apply anchors ─────────────────────────────────────────────────
+  anchors.forEach(({ lineIdx, startMs }) => { subtitles[lineIdx].startMs = startMs; });
+
+  // Average ms per lyric line — used for extrapolation at the edges
+  const avgLineMs = anchors.length > 1
+    ? (anchors[anchors.length - 1].startMs - anchors[0].startMs)
+      / (anchors[anchors.length - 1].lineIdx - anchors[0].lineIdx)
+    : 3000;
+
+  // ── Pass 3: interpolate gaps ───────────────────────────────────────────────
+  // Before first anchor
+  for (let i = anchors[0].lineIdx - 1; i >= 0; i--) {
+    subtitles[i].startMs = Math.max(0, subtitles[i + 1].startMs - avgLineMs);
+  }
+  // Between consecutive anchors
+  for (let k = 0; k < anchors.length - 1; k++) {
+    const a = anchors[k], b = anchors[k + 1];
+    for (let i = a.lineIdx + 1; i < b.lineIdx; i++) {
+      const t = (i - a.lineIdx) / (b.lineIdx - a.lineIdx);
+      subtitles[i].startMs = Math.round(a.startMs + t * (b.startMs - a.startMs));
+    }
+  }
+  // After last anchor
+  const tail = anchors[anchors.length - 1];
+  for (let i = tail.lineIdx + 1; i < subtitles.length; i++) {
+    subtitles[i].startMs = subtitles[i - 1].startMs + avgLineMs;
+  }
+
+  // Fix end times
+  for (let i = 0; i < subtitles.length - 1; i++) subtitles[i].endMs = subtitles[i + 1].startMs;
+  const last = subtitles[subtitles.length - 1];
+  if (last) last.endMs = last.startMs + 8000;
+
+  return true;
 }
 
 // DTW alignment: uses dynamic programming to map N lyric lines to M Whisper
 // segments by minimising normalised text-length difference as a cost proxy.
-// Much more robust than proportional distribution when segment count varies.
+// Filters out empty segments (instrumental/silence) before aligning so the
+// first lyric line isn't mapped to a silent intro.
 function alignByDTW(segs) {
   if (!segs.length || !subtitles.length) return;
+  // Drop segments with no transcribed text — they're likely instrumental
+  const meaningful = segs.filter(s => normalizeForAlign(s.text || '').length > 1);
+  if (meaningful.length >= Math.ceil(subtitles.length * 0.6)) segs = meaningful;
   const n = subtitles.length, m = segs.length;
 
   const cost = (i, j) => {
