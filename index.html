@@ -314,14 +314,15 @@
 
     .sync-controls { display: flex; gap: 10px; margin-top: 4px; }
 
-    #syncBtn {
+    #syncBtn, #autoSyncBtn {
       font-size: 0.75rem; padding: 5px 12px;
       background: transparent; color: var(--muted);
       border: 1px solid var(--border2); border-radius: 6px;
       cursor: pointer; font-family: inherit;
       transition: color 0.15s, border-color 0.15s;
     }
-    #syncBtn:hover { color: var(--text); border-color: #555; }
+    #syncBtn:hover, #autoSyncBtn:hover { color: var(--text); border-color: #555; }
+    #autoSyncBtn:disabled { opacity: 0.5; cursor: not-allowed; }
 
     /* ── Responsive ─────────────────────────────────────── */
     @media (max-width: 720px) {
@@ -412,7 +413,8 @@
     <div id="lyricsHeader">
       <span class="lbl">Lyrics</span>
       <div style="display:flex;align-items:center;gap:10px">
-        <button id="syncBtn" style="display:none" onclick="enterSyncMode()">⏱ Sync Timing</button>
+        <button id="autoSyncBtn" style="display:none" onclick="autoSync()">⚡ Auto Sync</button>
+        <button id="syncBtn" style="display:none" onclick="enterSyncMode()">⏱ Manual Sync</button>
         <span id="lyricsCount" style="font-size:0.78rem;color:var(--muted)"></span>
       </div>
     </div>
@@ -836,6 +838,134 @@ let activeTokenEl  = null;
 let videoMode      = false; // true when loaded from YouTube URL
 let hasRealSync    = false; // true when subtitles have real timestamps
 
+function setSyncButtons() {
+  const hide = hasRealSync || !player;
+  document.getElementById('syncBtn').style.display     = hide ? 'none' : '';
+  document.getElementById('autoSyncBtn').style.display = hide ? 'none' : '';
+}
+
+// ── Auto sync (Cobalt → Groq Whisper → align) ────────────────────────────────
+
+async function autoSync() {
+  if (!getKey()) { openSettings(); return; }
+  const videoId = extractVideoId(document.getElementById('urlInput').value.trim());
+  if (!videoId) { setStatus('Load a YouTube video first.', 'error'); return; }
+
+  const btn = document.getElementById('autoSyncBtn');
+  btn.disabled = true;
+
+  try {
+    btn.textContent = '⚡ Getting audio…';
+    const audioBlob = await fetchAudioViaCobalt(videoId);
+
+    btn.textContent = '⚡ Transcribing…';
+    const prompt = subtitles.slice(0, 8).map(s => s.text).join('\n');
+    const result = await transcribeWithWhisper(audioBlob, prompt);
+
+    btn.textContent = '⚡ Aligning…';
+    const words = result.words || [];
+    const segs  = result.segments || [];
+    if (words.length)     alignByWords(words);
+    else if (segs.length) alignBySegments(segs);
+    else throw new Error('Whisper returned no timing data');
+
+    hasRealSync = true;
+    btn.style.display = 'none';
+    document.getElementById('syncBtn').style.display = 'none';
+    setStatus('Lyrics timed automatically', 'ok');
+
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = '⚡ Auto Sync';
+    setStatus(`Auto sync failed: ${err.message} — use Manual Sync instead.`, 'error');
+  }
+}
+
+async function fetchAudioViaCobalt(videoId) {
+  const res = await fetch('https://api.cobalt.tools/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: JSON.stringify({
+      url: `https://www.youtube.com/watch?v=${videoId}`,
+      downloadMode: 'audio',
+      audioFormat: 'mp3',
+    }),
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) throw new Error(`Cobalt ${res.status}`);
+  const data = await res.json();
+  if (data.status === 'error') throw new Error(data.error?.code || 'Cobalt error');
+  const audioUrl = data.url;
+  if (!audioUrl) throw new Error('No audio URL from Cobalt');
+
+  const audioRes = await fetch(audioUrl, { signal: AbortSignal.timeout(180000) });
+  if (!audioRes.ok) throw new Error(`Audio download ${audioRes.status}`);
+  return await audioRes.blob();
+}
+
+async function transcribeWithWhisper(blob, prompt) {
+  const ext  = blob.type.includes('mp4') ? 'mp4' : 'mp3';
+  const form = new FormData();
+  form.append('file', new File([blob], `audio.${ext}`, { type: blob.type || 'audio/mpeg' }));
+  form.append('model', 'whisper-large-v3');
+  form.append('language', 'ja');
+  form.append('response_format', 'verbose_json');
+  form.append('timestamp_granularities[]', 'word');
+  form.append('timestamp_granularities[]', 'segment');
+  if (prompt) form.append('prompt', prompt.slice(0, 224));
+
+  const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${getKey()}` },
+    body: form,
+    signal: AbortSignal.timeout(180000),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error?.message || `Whisper ${res.status}`);
+  }
+  return await res.json();
+}
+
+// Align by matching the first few characters of each lyric line to Whisper words
+function alignByWords(words) {
+  if (!words.length || !subtitles.length) return;
+  const fullText   = words.map(w => (w.word || '').replace(/\s/g, '')).join('');
+  const charToWord = [];
+  let pos = 0;
+  words.forEach((w, wi) => {
+    (w.word || '').replace(/\s/g, '').split('').forEach(() => { charToWord[pos++] = wi; });
+  });
+
+  let searchFrom = 0;
+  subtitles.forEach(line => {
+    const query = line.text.replace(/\s/g, '').slice(0, 6);
+    if (!query) return;
+    const idx = fullText.indexOf(query, searchFrom);
+    if (idx < 0) return;
+    const wi  = charToWord[idx] ?? 0;
+    line.startMs  = Math.round((words[wi].start ?? 0) * 1000);
+    line.endMs    = Math.round((words[Math.min(wi + 4, words.length - 1)].end ?? words[wi].start + 3) * 1000);
+    searchFrom    = idx + 1;
+  });
+
+  // Each line's end = next line's start
+  for (let i = 0; i < subtitles.length - 1; i++) {
+    if (subtitles[i + 1].startMs > 0) subtitles[i].endMs = subtitles[i + 1].startMs;
+  }
+}
+
+// Fallback: distribute lines proportionally across Whisper segments
+function alignBySegments(segs) {
+  if (!segs.length || !subtitles.length) return;
+  subtitles.forEach((line, i) => {
+    const t   = subtitles.length > 1 ? i / (subtitles.length - 1) : 0;
+    const seg = segs[Math.min(Math.floor(t * segs.length), segs.length - 1)];
+    line.startMs = Math.round((seg.start ?? 0) * 1000);
+    line.endMs   = Math.round((seg.end   ?? seg.start + 3) * 1000);
+  });
+}
+
 // ── Tap-to-sync ───────────────────────────────────────────────────────────────
 
 let syncIdx     = 0;
@@ -859,7 +989,7 @@ function exitSyncMode() {
   // If at least one tap was recorded, the sync is usable
   if (syncIdx > 0) {
     hasRealSync = syncIdx >= subtitles.length;
-    document.getElementById('syncBtn').style.display = hasRealSync ? 'none' : '';
+    setSyncButtons();
   }
 }
 
@@ -1177,7 +1307,7 @@ async function loadVideo() {
   ci.innerHTML = `${subtitles.length} lines · <span class="warn">${source}</span>`;
 
   renderLyrics(subtitles);
-  document.getElementById('syncBtn').style.display = hasRealSync ? 'none' : '';
+  setSyncButtons();
   btn.disabled = false;
 
   if (getKey()) preAnalyze(0, 5);
@@ -1225,8 +1355,7 @@ async function loadPasted() {
   renderLyrics(subtitles);
   subtitles.forEach((_, i) => renderLineTokens(i));
   setStatus(`${lines.length} lines ready`, 'ok');
-  // Show sync button if a YouTube video is also loaded
-  document.getElementById('syncBtn').style.display = player ? '' : 'none';
+  setSyncButtons();
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────
