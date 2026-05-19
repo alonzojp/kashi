@@ -1325,11 +1325,17 @@ async function loadVideo() {
     if (!subtitles.length) {
       setProgress('Searching lyrics database…');
       try {
-        const oembed  = await getYouTubeOembed(videoId);
-        const cleaned = oembed ? cleanVideoTitle(oembed.title || '') : '';
-        const artist  = oembed?.author_name || '';
+        const oembed   = await getYouTubeOembed(videoId);
+        const rawTitle = oembed?.title || '';
+        const cleaned  = cleanVideoTitle(rawTitle);
         if (cleaned) {
-          const result = await searchLrcLib(cleaned, artist);
+          // Extract artist/track from title patterns like ARTIST「SONG」 or ARTIST - SONG
+          const { artist: titleArtist, track } = extractArtistAndTrack(cleaned);
+          // Channel name often has " - Topic" suffix for auto-generated music channels
+          const channelArtist = cleanChannelName(oembed?.author_name || '');
+          const searchTrack = track || cleaned;
+          // Pass title-extracted artist and channel name as two candidates
+          const result = await searchLrcLib(searchTrack, titleArtist, channelArtist);
           if (result?.syncedLyrics) {
             subtitles   = parseLRC(result.syncedLyrics);
             hasRealSync = subtitles.length > 0;
@@ -1484,6 +1490,27 @@ function cleanVideoTitle(title) {
     .trim();
 }
 
+// Extract artist and track from common YouTube title patterns
+function extractArtistAndTrack(title) {
+  // "ARTIST「SONG」" or "ARTIST『SONG』"
+  const jq = title.match(/^(.+?)[「『](.+?)[」』]/);
+  if (jq && jq[1].trim() && jq[2].trim()) {
+    return { artist: jq[1].trim(), track: jq[2].trim() };
+  }
+  // "ARTIST - SONG" or "ARTIST – SONG"
+  const dash = title.match(/^(.{2,35}?)\s*[-–]\s*(.{2,})$/);
+  if (dash) return { artist: dash[1].trim(), track: dash[2].trim() };
+  return { artist: '', track: title };
+}
+
+// Strip YouTube's auto-generated channel suffix and normalize
+function cleanChannelName(name) {
+  return (name || '')
+    .replace(/\s*-\s*Topic\s*$/i, '')
+    .replace(/\s*Official\s*$/i, '')
+    .trim();
+}
+
 async function getYouTubeOembed(videoId) {
   const res = await fetch(
     `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
@@ -1519,7 +1546,7 @@ function parseLRC(lrc) {
   return lines;
 }
 
-async function searchLrcLib(query, artist = '') {
+async function searchLrcLib(query, artist1 = '', artist2 = '') {
   const jaRe = /[぀-鿿一-鿿]/;
   const pickBest = results => {
     if (!Array.isArray(results) || !results.length) return null;
@@ -1528,8 +1555,8 @@ async function searchLrcLib(query, artist = '') {
     return withJa.find(r => r.syncedLyrics) || withJa[0];
   };
 
-  // Try artist + track first for a tighter match
-  if (artist && artist.length > 1) {
+  // Try each artist candidate with artist+track search (most precise)
+  for (const artist of [artist1, artist2].filter(a => a && a.length > 1)) {
     try {
       const r = await fetch(
         `https://lrclib.net/api/search?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(query)}`,
@@ -1539,13 +1566,18 @@ async function searchLrcLib(query, artist = '') {
     } catch {}
   }
 
-  // Broad query fallback
-  const res = await fetch(
-    `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`,
-    { signal: AbortSignal.timeout(8000) }
-  );
-  if (!res.ok) throw new Error('Lyrics search failed');
-  return pickBest(await res.json());
+  // Broad q= fallback only when the track name itself has Japanese characters,
+  // otherwise an English track name like "The Cute" easily matches the wrong song
+  if (!jaRe.test(query)) return null;
+
+  try {
+    const res = await fetch(
+      `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) return null;
+    return pickBest(await res.json());
+  } catch { return null; }
 }
 
 function lyricsToLines(plainLyrics) {
