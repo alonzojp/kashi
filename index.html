@@ -1277,91 +1277,121 @@ function showMainPanel(withVideo) {
 async function loadVideo() {
   const url = document.getElementById('urlInput').value.trim();
   if (!url) return;
-
   const videoId = extractVideoId(url);
   if (!videoId) { setStatus('Could not read a video ID from that URL.', 'error'); return; }
 
   const btn = document.getElementById('loadBtn');
   btn.disabled = true;
-  setStatus('Fetching Japanese subtitles…');
 
   subtitles      = [];
   currentLineIdx = -1;
-  lineCache      && Object.keys(lineCache).forEach(k => delete lineCache[k]);
+  hasRealSync    = false;
+  videoMode      = true;
+  Object.keys(lineCache).forEach(k => delete lineCache[k]);
 
+  // Show video player immediately; lyrics column shows loading progress
+  document.getElementById('captionInfo').style.display = 'none';
+  document.getElementById('lyricsCount').textContent = '';
+  document.getElementById('lyricsList').innerHTML =
+    `<div class="analyzing-msg"><span class="spinner"></span><span id="loadProgress">Loading…</span></div>`;
+  document.getElementById('wordDetailPanel').style.display = 'none';
   showMainPanel(true);
   createPlayer(videoId);
 
-  // 1 + 2. Fetch the YouTube page once — try captions first, then description
-  setStatus('Loading YouTube page…');
-  const page = await fetchYouTubePage(videoId);
+  const setProgress = msg => {
+    setStatus(msg);
+    const el = document.getElementById('loadProgress');
+    if (el) el.textContent = msg;
+  };
+
   let source = '';
 
-  if (page) {
-    setStatus('Scanning for Japanese captions…');
-    const captionResult = await captionsFromPageHtml(page.html, page.proxy);
-    if (captionResult?.lines.length) {
-      subtitles = captionResult.lines;
-      source = captionResult.auto ? '⚠ Auto-generated captions' : 'YouTube captions';
+  try {
+    // ── 1. YouTube captions ───────────────────────────────
+    setProgress('Fetching YouTube page…');
+    const page = await fetchYouTubePage(videoId);
+
+    if (page) {
+      setProgress('Scanning for Japanese captions…');
+      const captionResult = await captionsFromPageHtml(page.html, page.proxy);
+      if (captionResult?.lines.length) {
+        subtitles   = captionResult.lines;
+        hasRealSync = true;
+        source      = captionResult.auto ? 'Auto-generated captions' : 'YouTube captions';
+      }
+    }
+
+    // ── 2. lrclib.net — prefer syncedLyrics for real timestamps ──
+    if (!subtitles.length) {
+      setProgress('Searching lyrics database…');
+      try {
+        const oembed  = await getYouTubeOembed(videoId);
+        const cleaned = oembed ? cleanVideoTitle(oembed.title || '') : '';
+        const artist  = oembed?.author_name || '';
+        if (cleaned) {
+          const result = await searchLrcLib(cleaned, artist);
+          if (result?.syncedLyrics) {
+            subtitles   = parseLRC(result.syncedLyrics);
+            hasRealSync = subtitles.length > 0;
+            const info  = [result.artistName, result.trackName].filter(Boolean).join(' – ');
+            source      = `lrclib (timed)${info ? ': ' + info : ''}`;
+          } else if (result?.plainLyrics) {
+            subtitles = lyricsToLines(result.plainLyrics);
+            const info = [result.artistName, result.trackName].filter(Boolean).join(' – ');
+            source    = `lrclib${info ? ': ' + info : ''}`;
+          }
+        }
+      } catch {}
+    }
+
+    // ── 3. Video description ──────────────────────────────
+    if (!subtitles.length && page) {
+      setProgress('Checking video description…');
+      const descLines = await fetchFromDescription(videoId, page);
+      if (descLines?.length > 2) { subtitles = descLines; source = 'Video description'; }
+    }
+
+    // ── 4. Pinned comment ─────────────────────────────────
+    if (!subtitles.length && getYtKey()) {
+      setProgress('Checking pinned comment…');
+      const commentLines = await fetchPinnedComment(videoId);
+      if (commentLines?.length > 3) { subtitles = commentLines; source = 'Pinned comment'; }
     }
 
     if (!subtitles.length) {
-      setStatus('No captions — checking description…');
-      const descLines = await fetchFromDescription(videoId, page);
-      if (descLines?.length > 2) { subtitles = descLines; source = 'Lyrics from description'; }
+      setStatus('No lyrics found. Try pasting them manually below.', 'error');
+      document.getElementById('lyricsList').innerHTML =
+        '<div style="padding:16px;color:var(--red);font-size:0.9rem">No lyrics found for this video. Try the paste option below.</div>';
+      if (!document.getElementById('pasteArea').classList.contains('open')) togglePaste();
+      btn.disabled = false;
+      return;
     }
-  }
 
-  // 3. Try pinned/top comment (requires YouTube API key)
-  if (!subtitles.length) {
-    if (getYtKey()) {
-      setStatus('Checking pinned comment…');
-      const commentLines = await fetchPinnedComment(videoId);
-      if (commentLines?.length > 3) { subtitles = commentLines; source = 'Lyrics from pinned comment'; }
+    // ── 5. Analyze all lines upfront ─────────────────────
+    if (getKey()) {
+      setProgress(`Analyzing 0 / ${subtitles.length} lines…`);
+      await analyzeAll((done, total) => setProgress(`Analyzing ${done} / ${total} lines…`));
     }
-  }
 
-  // 4. Try lrclib.net using the video title as a last resort
-  if (!subtitles.length) {
-    try {
-      setStatus('Trying lyrics database…');
-      const rawTitle = await fetchYouTubeOembedTitle(videoId);
-      if (rawTitle) {
-        const cleaned = cleanVideoTitle(rawTitle);
-        const result  = await searchLrcLib(cleaned);
-        if (result?.plainLyrics) {
-          subtitles = lyricsToLines(result.plainLyrics);
-          const songInfo = [result.artistName, result.trackName].filter(Boolean).join(' – ');
-          source = `lrclib: ${songInfo}`;
-        }
-      }
-    } catch {}
-  }
+    // ── 6. Render everything at once ──────────────────────
+    renderLyrics(subtitles);
+    if (getKey()) subtitles.forEach((_, i) => renderLineTokens(i));
 
-  if (!subtitles.length) {
-    setStatus('No Japanese lyrics found automatically.', 'error');
     const ci = document.getElementById('captionInfo');
     ci.style.display = 'block';
-    ci.innerHTML = 'Could not find lyrics automatically. Use "Paste lyrics manually" below — or try searching by Spotify URL or Artist – Song.'
-      + (getYtKey() ? '' : ' Adding a <a onclick="openSettings()" style="color:var(--red);cursor:pointer">YouTube API key</a> enables pinned comment search.');
-    btn.disabled = false;
-    return;
+    ci.innerHTML = `${subtitles.length} lines · <span class="warn">${source}</span>${hasRealSync ? ' · ⏱ timed' : ''}`;
+
+    document.getElementById('lyricsCount').textContent = `${subtitles.length} lines`;
+    setSyncButtons();
+    setStatus(`${subtitles.length} lines ready`, 'ok');
+
+  } catch (err) {
+    setStatus('Error: ' + err.message, 'error');
+    document.getElementById('lyricsList').innerHTML =
+      `<div style="padding:16px;color:var(--red);font-size:0.9rem">Error: ${err.message}</div>`;
   }
 
-  videoMode = true;
-  // Captions from YouTube have real timestamps; description/comment don't
-  hasRealSync = (source === 'YouTube captions');
-  setStatus(`Loaded ${subtitles.length} lines`, 'ok');
-
-  const ci = document.getElementById('captionInfo');
-  ci.style.display = 'block';
-  ci.innerHTML = `${subtitles.length} lines · <span class="warn">${source}</span>`;
-
-  renderLyrics(subtitles);
-  setSyncButtons();
   btn.disabled = false;
-
-  if (getKey()) preAnalyze(0, 5);
 }
 
 // ── Load from pasted lyrics ───────────────────────────────────────────────────
@@ -1454,14 +1484,13 @@ function cleanVideoTitle(title) {
     .trim();
 }
 
-async function fetchYouTubeOembedTitle(videoId) {
+async function getYouTubeOembed(videoId) {
   const res = await fetch(
     `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
     { signal: AbortSignal.timeout(6000) }
   );
-  if (!res.ok) return '';
-  const data = await res.json();
-  return data.title || '';
+  if (!res.ok) return null;
+  return await res.json(); // { title, author_name, ... }
 }
 
 async function fetchSpotifyOembedTitle(spotifyUrl) {
@@ -1474,17 +1503,49 @@ async function fetchSpotifyOembedTitle(spotifyUrl) {
   return data.title || '';
 }
 
-async function searchLrcLib(query) {
+function parseLRC(lrc) {
+  const re = /^\[(\d{1,2}):(\d{2})\.(\d{2,3})\](.*)$/;
+  const lines = [];
+  for (const raw of lrc.split('\n')) {
+    const m = raw.trim().match(re);
+    if (!m) continue;
+    const ms   = (parseInt(m[1]) * 60 + parseInt(m[2])) * 1000
+               + parseInt(m[3].length === 2 ? m[3] + '0' : m[3]);
+    const text = m[4].trim();
+    if (text) lines.push({ startMs: ms, endMs: 0, text });
+  }
+  for (let i = 0; i < lines.length - 1; i++) lines[i].endMs = lines[i + 1].startMs;
+  if (lines.length) lines[lines.length - 1].endMs = lines[lines.length - 1].startMs + 8000;
+  return lines;
+}
+
+async function searchLrcLib(query, artist = '') {
+  const jaRe = /[぀-鿿一-鿿]/;
+  const pickBest = results => {
+    if (!Array.isArray(results) || !results.length) return null;
+    return results.find(r => jaRe.test(r.syncedLyrics  || '') && r.syncedLyrics)
+        || results.find(r => jaRe.test(r.plainLyrics   || '') && (r.syncedLyrics || r.plainLyrics))
+        || (results[0]?.syncedLyrics || results[0]?.plainLyrics ? results[0] : null);
+  };
+
+  // Try artist + track first for a tighter match
+  if (artist && artist.length > 1) {
+    try {
+      const r = await fetch(
+        `https://lrclib.net/api/search?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(query)}`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      if (r.ok) { const hit = pickBest(await r.json()); if (hit) return hit; }
+    } catch {}
+  }
+
+  // Broad query fallback
   const res = await fetch(
     `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`,
     { signal: AbortSignal.timeout(8000) }
   );
   if (!res.ok) throw new Error('Lyrics search failed');
-  const results = await res.json();
-  if (!Array.isArray(results) || results.length === 0) return null;
-  const jpResult = results.find(r => /[぀-鿿一-鿿]/.test(r.plainLyrics || ''))
-                || results[0];
-  return jpResult?.plainLyrics ? jpResult : null;
+  return pickBest(await res.json());
 }
 
 function lyricsToLines(plainLyrics) {
@@ -1523,7 +1584,7 @@ async function doLyricsSearch() {
 
     const songInfo = [result.artistName, result.trackName].filter(Boolean).join(' – ');
     setLyricsSearchStatus(`Found: ${songInfo}`, 'ok');
-    document.getElementById('lyricsInput').value = result.plainLyrics;
+    document.getElementById('lyricsInput').value = result.plainLyrics || '';
 
   } catch (err) {
     setLyricsSearchStatus('⚠ ' + err.message, 'fail');
