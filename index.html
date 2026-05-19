@@ -331,6 +331,34 @@
       #lyricsCol { max-height: 55vh; }
     }
 
+    /* ── Lyrics search (paste section) ─────────────────── */
+    .lyrics-fetch-row { display: flex; gap: 8px; margin-bottom: 8px; }
+    #lyricsSearchInput {
+      flex: 1; background: var(--bg); border: 1px solid var(--border2);
+      border-radius: 8px; color: var(--text); font-size: 0.88rem;
+      padding: 9px 12px; outline: none; font-family: inherit;
+      transition: border-color 0.2s;
+    }
+    #lyricsSearchInput:focus { border-color: var(--red); }
+    #lyricsSearchInput::placeholder { color: #2e2e3e; }
+    #lyricsSearchBtn {
+      background: transparent; color: var(--muted);
+      border: 1px solid var(--border2); border-radius: 8px;
+      padding: 9px 14px; font-size: 0.85rem; cursor: pointer;
+      white-space: nowrap; font-family: inherit;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    #lyricsSearchBtn:hover:not(:disabled) { color: var(--text); border-color: #555; }
+    #lyricsSearchBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+    #lyricsSearchStatus {
+      font-size: 0.78rem; color: var(--muted);
+      min-height: 1.1em; margin-bottom: 10px;
+    }
+    #lyricsSearchStatus.ok   { color: #5cb85c; }
+    #lyricsSearchStatus.fail { color: var(--red); }
+    .paste-or { font-size: 0.75rem; color: #444; text-align: center;
+                margin: 10px 0 8px; text-transform: uppercase; letter-spacing: 0.08em; }
+
     footer { margin-top: 32px; color: #333; font-size: 0.75rem; text-align: center; }
     footer a { color: #555; text-decoration: none; }
     footer a:hover { color: #888; }
@@ -388,6 +416,12 @@
   <div id="pasteToggle">
     <button id="pasteToggleBtn" onclick="togglePaste()">▸ No subtitles? Paste lyrics manually</button>
     <div id="pasteArea">
+      <div class="lyrics-fetch-row">
+        <input type="text" id="lyricsSearchInput" placeholder="Spotify URL  or  Artist – Song title" />
+        <button id="lyricsSearchBtn" onclick="doLyricsSearch()">Fetch</button>
+      </div>
+      <div id="lyricsSearchStatus"></div>
+      <div class="paste-or">or paste manually</div>
       <textarea id="lyricsInput" placeholder="Paste Japanese lyrics here, one line per line…" spellcheck="false"></textarea>
       <div style="display:flex;gap:10px;align-items:center">
         <button class="btn-primary" onclick="loadPasted()">Analyze Lyrics</button>
@@ -1287,12 +1321,29 @@ async function loadVideo() {
     }
   }
 
+  // 4. Try lrclib.net using the video title as a last resort
+  if (!subtitles.length) {
+    try {
+      setStatus('Trying lyrics database…');
+      const rawTitle = await fetchYouTubeOembedTitle(videoId);
+      if (rawTitle) {
+        const cleaned = cleanVideoTitle(rawTitle);
+        const result  = await searchLrcLib(cleaned);
+        if (result?.plainLyrics) {
+          subtitles = lyricsToLines(result.plainLyrics);
+          const songInfo = [result.artistName, result.trackName].filter(Boolean).join(' – ');
+          source = `lrclib: ${songInfo}`;
+        }
+      }
+    } catch {}
+  }
+
   if (!subtitles.length) {
     setStatus('No Japanese lyrics found automatically.', 'error');
     const ci = document.getElementById('captionInfo');
     ci.style.display = 'block';
-    ci.innerHTML = 'Could not find lyrics automatically. Try the "Paste lyrics manually" option below'
-      + (getYtKey() ? '' : ', or add a <a onclick="openSettings()" style="color:var(--red);cursor:pointer">YouTube API key</a> to also search the pinned comment.');
+    ci.innerHTML = 'Could not find lyrics automatically. Use "Paste lyrics manually" below — or try searching by Spotify URL or Artist – Song.'
+      + (getYtKey() ? '' : ' Adding a <a onclick="openSettings()" style="color:var(--red);cursor:pointer">YouTube API key</a> enables pinned comment search.');
     btn.disabled = false;
     return;
   }
@@ -1382,6 +1433,104 @@ function togglePaste() {
 document.getElementById('urlInput').addEventListener('keydown', e => {
   if (e.key === 'Enter') loadVideo();
 });
+
+document.getElementById('lyricsSearchInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLyricsSearch();
+});
+
+// ── lrclib lyric fetching ─────────────────────────────────────────────────────
+
+function cleanVideoTitle(title) {
+  return title
+    .replace(/\(Official\s*(Music\s*)?(Video|Audio|MV|Lyric\s*Video|Visualizer)\)/gi, '')
+    .replace(/\[Official\s*(Music\s*)?(Video|Audio|MV|Lyric\s*Video|Visualizer)\]/gi, '')
+    .replace(/【[^】]{0,30}】/g, '')
+    .replace(/\[([^\]]{0,30})\]/g, '')
+    .replace(/\bM\.?V\.?\b/g, '')
+    .replace(/\bOfficial\b/gi, '')
+    .replace(/\bfeat\..*/gi, '')
+    .replace(/[-–—]\s*(Official|Music|Video|MV|Lyric|Audio|Visualizer)\b.*/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function fetchYouTubeOembedTitle(videoId) {
+  const res = await fetch(
+    `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
+    { signal: AbortSignal.timeout(6000) }
+  );
+  if (!res.ok) return '';
+  const data = await res.json();
+  return data.title || '';
+}
+
+async function fetchSpotifyOembedTitle(spotifyUrl) {
+  const res = await fetch(
+    `https://open.spotify.com/oembed?url=${encodeURIComponent(spotifyUrl)}`,
+    { signal: AbortSignal.timeout(6000) }
+  );
+  if (!res.ok) throw new Error('Could not retrieve Spotify track info');
+  const data = await res.json();
+  return data.title || '';
+}
+
+async function searchLrcLib(query) {
+  const res = await fetch(
+    `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`,
+    { signal: AbortSignal.timeout(8000) }
+  );
+  if (!res.ok) throw new Error('Lyrics search failed');
+  const results = await res.json();
+  if (!Array.isArray(results) || results.length === 0) return null;
+  const jpResult = results.find(r => /[぀-鿿一-鿿]/.test(r.plainLyrics || ''))
+                || results[0];
+  return jpResult?.plainLyrics ? jpResult : null;
+}
+
+function lyricsToLines(plainLyrics) {
+  return plainLyrics.split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 0)
+    .map((text, i) => ({ startMs: i * 5000, endMs: (i + 1) * 5000, text }));
+}
+
+function setLyricsSearchStatus(msg, cls = '') {
+  const el = document.getElementById('lyricsSearchStatus');
+  el.textContent = msg;
+  el.className = cls;
+}
+
+async function doLyricsSearch() {
+  const query = document.getElementById('lyricsSearchInput').value.trim();
+  if (!query) return;
+
+  const btn = document.getElementById('lyricsSearchBtn');
+  btn.disabled = true;
+  setLyricsSearchStatus('Fetching…');
+
+  try {
+    let searchQuery = query;
+
+    const spMatch = query.match(/open\.spotify\.com\/track\/([a-zA-Z0-9]+)/);
+    if (spMatch) {
+      setLyricsSearchStatus('Getting track info from Spotify…');
+      searchQuery = await fetchSpotifyOembedTitle(query);
+    }
+
+    setLyricsSearchStatus(`Searching lyrics for "${searchQuery}"…`);
+    const result = await searchLrcLib(searchQuery);
+    if (!result) throw new Error('No lyrics found — try "Artist – Song title"');
+
+    const songInfo = [result.artistName, result.trackName].filter(Boolean).join(' – ');
+    setLyricsSearchStatus(`Found: ${songInfo}`, 'ok');
+    document.getElementById('lyricsInput').value = result.plainLyrics;
+
+  } catch (err) {
+    setLyricsSearchStatus('⚠ ' + err.message, 'fail');
+  } finally {
+    btn.disabled = false;
+  }
+}
 </script>
 
 <!-- YouTube iframe API — must load after the script above defines onYouTubeIframeAPIReady -->
