@@ -156,15 +156,15 @@
     }
     #noKeyBanner a { color: #d4c840; cursor: pointer; }
 
-    /* ── Main split panel ───────────────────────────────── */
+    /* ── Main panel — vertical stack ───────────────────── */
     #mainPanel {
-      display: none; width: 100%; max-width: 1200px;
-      gap: 14px; align-items: flex-start;
-      flex-direction: row;
+      display: none; width: 100%; max-width: 860px;
+      gap: 14px; align-items: stretch;
+      flex-direction: column;
     }
 
-    /* Video column */
-    #videoCol { flex: 0 0 44%; position: sticky; top: 16px; }
+    /* Video */
+    #videoCol { width: 100%; }
 
     .video-wrapper {
       position: relative; padding-bottom: 56.25%; height: 0;
@@ -181,11 +181,26 @@
     }
     #captionInfo .warn { color: #bba840; }
 
-    /* Lyrics column */
-    #lyricsCol {
-      flex: 1; max-height: calc(100vh - 100px); overflow-y: auto;
+    /* ── Current line display ───────────────────────────── */
+    #currentLinePanel {
       background: var(--surface); border: 1px solid var(--border);
-      border-radius: 16px; padding: 18px 20px;
+      border-radius: 16px; padding: 22px 28px;
+      display: flex; flex-direction: column; align-items: center; gap: 10px;
+    }
+    #currentLineJp {
+      font-size: 2rem; line-height: 3.6; color: #fff;
+      display: flex; flex-wrap: wrap; justify-content: center; align-items: flex-end;
+      cursor: default; user-select: none; text-align: center;
+    }
+    #currentLineJp.plain { display: block; line-height: 1.9; font-size: 2rem; user-select: text; }
+    #currentLineJp .sent-token ruby rt { font-size: 0.48em; color: var(--red); text-align: center; }
+    #currentLineTr { font-size: 0.9rem; color: #666; font-style: italic; text-align: center; }
+
+    /* Lyrics column — secondary overview */
+    #lyricsCol {
+      max-height: 260px; overflow-y: auto;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 16px; padding: 14px 18px;
     }
 
     #lyricsHeader {
@@ -241,9 +256,9 @@
 
     /* ── Word detail panel ───────────────────────────────── */
     #wordDetailPanel {
-      display: none; width: 100%; max-width: 1200px;
+      display: none; width: 100%;
       background: var(--surface); border: 1px solid var(--border);
-      border-radius: 16px; padding: 22px 26px; margin-top: 12px;
+      border-radius: 16px; padding: 22px 26px;
     }
     .wd-inner { display: flex; align-items: flex-start; gap: 20px; }
 
@@ -324,11 +339,9 @@
     #syncBtn:hover, #autoSyncBtn:hover { color: var(--text); border-color: #555; }
     #autoSyncBtn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-    /* ── Responsive ─────────────────────────────────────── */
     @media (max-width: 720px) {
-      #mainPanel { flex-direction: column; }
-      #videoCol { position: static; flex: none; width: 100%; }
-      #lyricsCol { max-height: 55vh; }
+      #lyricsCol { max-height: 180px; }
+      #currentLineJp { font-size: 1.5rem; }
     }
 
     /* ── Lyrics search (paste section) ─────────────────── */
@@ -451,21 +464,32 @@
   </div>
 </div>
 
-<!-- Main split panel -->
+<!-- Main panel — vertical stack -->
 <div id="mainPanel">
 
-  <!-- Video column -->
+  <!-- Video -->
   <div id="videoCol">
-    <div class="video-wrapper">
-      <div id="ytplayer"></div>
-    </div>
+    <div class="video-wrapper"><div id="ytplayer"></div></div>
     <div id="captionInfo" style="display:none"></div>
   </div>
 
-  <!-- Lyrics column -->
+  <!-- Current playing line (large, with furigana, clickable) -->
+  <div id="currentLinePanel" style="display:none">
+    <div id="currentLineJp" class="plain"></div>
+    <div id="currentLineTr"></div>
+  </div>
+
+  <!-- Word detail (inside panel so it sits right below the current line) -->
+  <div id="wordDetailPanel">
+    <div class="wd-inner">
+      <div class="wd-hint">Tap any word above to see its reading and definition</div>
+    </div>
+  </div>
+
+  <!-- All lyrics — secondary overview for navigation -->
   <div id="lyricsCol">
     <div id="lyricsHeader">
-      <span class="lbl">Lyrics</span>
+      <span class="lbl">All lyrics</span>
       <div style="display:flex;align-items:center;gap:10px">
         <button id="autoSyncBtn" style="display:none" onclick="autoSync()">⚡ Auto Sync</button>
         <button id="syncBtn" style="display:none" onclick="enterSyncMode()">⏱ Manual Sync</button>
@@ -487,13 +511,6 @@
   <div class="sync-controls">
     <button class="btn-ghost" onclick="undoTap()" id="syncUndoBtn">↩ Undo</button>
     <button class="btn-ghost" onclick="exitSyncMode()">Cancel</button>
-  </div>
-</div>
-
-<!-- Word detail panel -->
-<div id="wordDetailPanel">
-  <div class="wd-inner">
-    <div class="wd-hint">Click any word in the lyrics above to see its reading and definition</div>
   </div>
 </div>
 
@@ -767,24 +784,29 @@ async function analyzeLine(idx) {
   if (lineCache[idx]) return lineCache[idx];
   if (!getKey() || !subtitles[idx]) return null;
 
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${getKey()}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
-      messages: [
-        { role: 'system', content: 'You are a Japanese language expert. Respond only with valid JSON.' },
-        { role: 'user',   content: LYRIC_PROMPT + subtitles[idx].text }
-      ],
-      temperature: 0.1,
-      response_format: { type: 'json_object' }
-    })
-  });
-  if (!res.ok) throw new Error(`Groq ${res.status}`);
-  const data   = await res.json();
-  const result = JSON.parse(data.choices[0].message.content);
-  lineCache[idx] = result;
-  return result;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    if (attempt > 0) await new Promise(r => setTimeout(r, 2500 * attempt));
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${getKey()}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: 'You are a Japanese language expert. Respond only with valid JSON.' },
+          { role: 'user',   content: LYRIC_PROMPT + subtitles[idx].text }
+        ],
+        temperature: 0.1,
+        response_format: { type: 'json_object' }
+      })
+    });
+    if (res.status === 429) continue; // rate limited — wait and retry
+    if (!res.ok) throw new Error(`Groq ${res.status}`);
+    const data   = await res.json();
+    const result = JSON.parse(data.choices[0].message.content);
+    lineCache[idx] = result;
+    return result;
+  }
+  throw new Error('Rate limited');
 }
 
 // Pre-analyze a window of lines ahead of playback (used during video sync)
@@ -793,22 +815,21 @@ async function preAnalyze(fromIdx, count = 4) {
   for (let i = fromIdx; i < Math.min(fromIdx + count, subtitles.length); i++) {
     if (lineCache[i]) { renderLineTokens(i); continue; }
     try { await analyzeLine(i); renderLineTokens(i); } catch {}
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 2000));
   }
 }
 
-// Analyze all lines in parallel batches of 3, filling the cache only (no rendering)
+// Analyze all lines one at a time — Groq free tier allows ~30 req/min,
+// so 2 s between requests keeps us safe without overcomplicating it.
 async function analyzeAll(onProgress) {
   if (!getKey() || !subtitles.length) return;
   const indices = subtitles.map((_, i) => i).filter(i => !lineCache[i]);
   let done = 0;
-  for (let i = 0; i < indices.length; i += 3) {
-    await Promise.allSettled(
-      indices.slice(i, i + 3).map(idx =>
-        analyzeLine(idx).then(() => { done++; onProgress?.(done, indices.length); }).catch(() => { done++; onProgress?.(done, indices.length); })
-      )
-    );
-    if (i + 3 < indices.length) await new Promise(r => setTimeout(r, 250));
+  for (const idx of indices) {
+    try { await analyzeLine(idx); } catch {}
+    done++;
+    onProgress?.(done, indices.length);
+    if (done < indices.length) await new Promise(r => setTimeout(r, 2100));
   }
 }
 
@@ -1322,46 +1343,26 @@ function renderLineTokens(idx) {
   const result = lineCache[idx];
   if (!result) return;
 
+  // Update lyric list row
   const lineEl = document.querySelector(`.lyric-line[data-idx="${idx}"]`);
-  if (!lineEl) return;
-
-  // Replace plain text with interactive tokens
-  const jp = lineEl.querySelector('.line-jp');
-  if (!jp || !jp.classList.contains('plain')) return; // already rendered
-  jp.className = 'line-jp';
-  jp.innerHTML = '';
-
-  (result.tokens || []).forEach(token => {
-    const span    = document.createElement('span');
-    span.className = 'sent-token';
-
-    const surface  = token.surface || '';
-    const reading  = (token.reading && token.reading !== surface) ? token.reading : '';
-    const rubyHtml = reading ? buildRubyHTML(surface, reading, token.furigana) : null;
-
-    if (rubyHtml) {
-      const tmp = document.createElement('span');
-      tmp.innerHTML = rubyHtml;
-      while (tmp.firstChild) span.appendChild(tmp.firstChild);
-    } else {
-      span.textContent = surface;
+  if (lineEl) {
+    const jp = lineEl.querySelector('.line-jp');
+    if (jp?.classList.contains('plain')) {
+      jp.className = 'line-jp';
+      jp.innerHTML = '';
+      const frag = makeTokenSpans(idx, (token, span) => selectToken(token, span));
+      if (frag) jp.appendChild(frag);
     }
-
-    span.addEventListener('click', e => { e.stopPropagation(); selectToken(token, span); });
-    jp.appendChild(span);
-  });
-
-  // Remove loading indicator if present
-  const loading = lineEl.querySelector('.line-loading');
-  if (loading) loading.remove();
-
-  // Add English translation
-  if (result.translation && !lineEl.querySelector('.line-en')) {
-    const en = document.createElement('div');
-    en.className = 'line-en';
-    en.textContent = result.translation;
-    lineEl.appendChild(en);
+    if (result.translation && !lineEl.querySelector('.line-en')) {
+      const en = document.createElement('div');
+      en.className = 'line-en';
+      en.textContent = result.translation;
+      lineEl.appendChild(en);
+    }
   }
+
+  // If this is the currently playing line, refresh the big display too
+  if (idx === currentLineIdx) updateCurrentLineDisplay(idx);
 }
 
 // ── Word detail card ──────────────────────────────────────────────────────────
@@ -1447,12 +1448,62 @@ function syncTime() {
   if (idx >= 0) preAnalyze(idx, 4);
 }
 
+// Build interactive token spans for a lyric line (shared by list + current-line panel)
+function makeTokenSpans(idx, onTokenClick) {
+  const result = lineCache[idx];
+  if (!result?.tokens?.length) return null;
+  const frag = document.createDocumentFragment();
+  (result.tokens || []).forEach(token => {
+    const span = document.createElement('span');
+    span.className = 'sent-token';
+    const surface  = token.surface || '';
+    const reading  = (token.reading && token.reading !== surface) ? token.reading : '';
+    const rubyHtml = reading ? buildRubyHTML(surface, reading, token.furigana) : null;
+    if (rubyHtml) {
+      const tmp = document.createElement('span');
+      tmp.innerHTML = rubyHtml;
+      while (tmp.firstChild) span.appendChild(tmp.firstChild);
+    } else {
+      span.textContent = surface;
+    }
+    span.addEventListener('click', e => { e.stopPropagation(); onTokenClick(token, span); });
+    frag.appendChild(span);
+  });
+  return frag;
+}
+
+function updateCurrentLineDisplay(idx) {
+  const panel = document.getElementById('currentLinePanel');
+  const jpEl  = document.getElementById('currentLineJp');
+  const trEl  = document.getElementById('currentLineTr');
+
+  if (idx < 0 || idx >= subtitles.length) {
+    panel.style.display = 'none';
+    return;
+  }
+
+  panel.style.display = '';
+  jpEl.innerHTML = '';
+
+  const frag = makeTokenSpans(idx, (token, span) => selectToken(token, span));
+  if (frag) {
+    jpEl.appendChild(frag);
+    jpEl.className = '';
+  } else {
+    jpEl.textContent = subtitles[idx]?.text || '';
+    jpEl.className = 'plain';
+  }
+
+  trEl.textContent = lineCache[idx]?.translation || '';
+}
+
 function applyHighlight() {
   document.querySelectorAll('.lyric-line').forEach((el, i) => {
     el.classList.toggle('active', i === currentLineIdx);
     el.classList.toggle('past',   i < currentLineIdx);
   });
   if (currentLineIdx >= 0) scrollLineIntoView(currentLineIdx);
+  updateCurrentLineDisplay(currentLineIdx);
 }
 
 function scrollLineIntoView(idx) {
