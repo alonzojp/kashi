@@ -784,8 +784,7 @@ async function analyzeLine(idx) {
   if (lineCache[idx]) return lineCache[idx];
   if (!getKey() || !subtitles[idx]) return null;
 
-  for (let attempt = 0; attempt < 4; attempt++) {
-    if (attempt > 0) await new Promise(r => setTimeout(r, 4000));
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
@@ -801,17 +800,21 @@ async function analyzeLine(idx) {
         }),
         signal: AbortSignal.timeout(20000),
       });
-      if (res.status === 429) continue;
+      if (res.status === 429) {
+        await new Promise(r => setTimeout(r, 6000 * (attempt + 1))); // wait only when actually rate limited
+        continue;
+      }
       if (!res.ok) throw new Error(`Groq ${res.status}`);
       const data   = await res.json();
       const result = JSON.parse(data.choices[0].message.content);
       lineCache[idx] = result;
       return result;
     } catch (e) {
-      if (attempt === 3) throw e;
+      if (attempt < 4 && (e.name === 'TimeoutError' || e.name === 'AbortError')) continue;
+      throw e;
     }
   }
-  throw new Error('Rate limited after 4 attempts');
+  throw new Error('Rate limited');
 }
 
 // Pre-analyze a window of lines ahead of playback (used during video sync)
@@ -824,17 +827,20 @@ async function preAnalyze(fromIdx, count = 4) {
   }
 }
 
-// Analyze all lines one at a time — Groq free tier allows ~30 req/min,
-// so 2 s between requests keeps us safe without overcomplicating it.
+// Analyze all lines — send in batches of 3 with no artificial delay.
+// analyzeLine itself backs off only when it actually receives a 429.
 async function analyzeAll(onProgress) {
   if (!getKey() || !subtitles.length) return;
   const indices = subtitles.map((_, i) => i).filter(i => !lineCache[i]);
   let done = 0;
-  for (const idx of indices) {
-    try { await analyzeLine(idx); } catch {}
-    done++;
-    onProgress?.(done, indices.length);
-    if (done < indices.length) await new Promise(r => setTimeout(r, 2100));
+  for (let i = 0; i < indices.length; i += 3) {
+    await Promise.allSettled(
+      indices.slice(i, i + 3).map(idx =>
+        analyzeLine(idx)
+          .then(() => { done++; onProgress?.(done, indices.length); })
+          .catch(() => { done++; onProgress?.(done, indices.length); })
+      )
+    );
   }
 }
 
