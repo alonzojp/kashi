@@ -1105,16 +1105,21 @@ function alignByWords(words) {
   // ── Pass 2: apply anchors ─────────────────────────────────────────────────
   anchors.forEach(({ lineIdx, startMs }) => { subtitles[lineIdx].startMs = startMs; });
 
-  // Average ms per lyric line — used for extrapolation at the edges
+  // Average ms per lyric line — used for forward extrapolation after last anchor
   const avgLineMs = anchors.length > 1
     ? (anchors[anchors.length - 1].startMs - anchors[0].startMs)
       / (anchors[anchors.length - 1].lineIdx - anchors[0].lineIdx)
     : 3000;
 
   // ── Pass 3: interpolate gaps ───────────────────────────────────────────────
-  // Before first anchor
-  for (let i = anchors[0].lineIdx - 1; i >= 0; i--) {
-    subtitles[i].startMs = Math.max(0, subtitles[i + 1].startMs - avgLineMs);
+  // Before first anchor: spread proportionally from 0 → first anchor time.
+  // Linear backward extrapolation with clamping causes multiple lines to
+  // collapse to 0ms, making syncTime jump past all of them at video start.
+  const first = anchors[0];
+  for (let i = 0; i < first.lineIdx; i++) {
+    subtitles[i].startMs = first.lineIdx > 0
+      ? Math.round((i / first.lineIdx) * first.startMs)
+      : 0;
   }
   // Between consecutive anchors
   for (let k = 0; k < anchors.length - 1; k++) {
