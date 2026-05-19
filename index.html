@@ -359,6 +359,19 @@
     .paste-or { font-size: 0.75rem; color: #444; text-align: center;
                 margin: 10px 0 8px; text-transform: uppercase; letter-spacing: 0.08em; }
 
+    /* ── Local server banner ────────────────────────────── */
+    #serverBanner {
+      display: none; width: 100%; max-width: 860px; margin-bottom: 14px;
+      background: #12181a; border: 1px solid #2a3a3f;
+      border-radius: 12px; padding: 14px 20px;
+      font-size: 0.84rem; color: #8ab4c0; line-height: 1.6;
+    }
+    #serverBanner code {
+      background: #1a2a2f; border-radius: 4px;
+      padding: 1px 7px; font-size: 0.82rem; color: #a8d8e0;
+    }
+    #serverBanner strong { color: #b8dde5; }
+
     footer { margin-top: 32px; color: #333; font-size: 0.75rem; text-align: center; }
     footer a { color: #555; text-decoration: none; }
     footer a:hover { color: #888; }
@@ -397,6 +410,13 @@
       <button class="btn-primary" onclick="saveSettings()">Save</button>
     </div>
   </div>
+</div>
+
+<!-- Local server banner -->
+<div id="serverBanner">
+  <strong>⚡ For reliable auto-sync:</strong> run <code>python audio_server.py</code> in the kashi folder (requires <code>pip install yt-dlp</code>).
+  Keep that terminal open while using Kashi — the browser will use it automatically.
+  Without it, sync falls back to public services which may be slow or unavailable.
 </div>
 
 <!-- No-key banner -->
@@ -929,30 +949,91 @@ async function autoSync() {
   }
 }
 
-async function fetchAudioViaCobalt(videoId) {
-  const res = await fetch('https://api.cobalt.tools/', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    body: JSON.stringify({
-      url: `https://www.youtube.com/watch?v=${videoId}`,
-      downloadMode: 'audio',
-      audioFormat: 'mp3',
-    }),
-    signal: AbortSignal.timeout(20000),
-  });
-  if (!res.ok) throw new Error(`Cobalt ${res.status}`);
-  const data = await res.json();
-  if (data.status === 'error') throw new Error(data.error?.code || 'Cobalt error');
-  const audioUrl = data.url;
-  if (!audioUrl) throw new Error('No audio URL from Cobalt');
+// ── Audio fetching (multiple sources, cascading) ──────────────────────────────
 
-  const audioRes = await fetch(audioUrl, { signal: AbortSignal.timeout(180000) });
-  if (!audioRes.ok) throw new Error(`Audio download ${audioRes.status}`);
-  return await audioRes.blob();
+// Show/hide the local-server setup banner
+function setServerBanner(visible) {
+  document.getElementById('serverBanner').style.display = visible ? 'block' : 'none';
 }
 
+async function fetchYouTubeAudio(videoId) {
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
+  // ── 1. Local yt-dlp server (most reliable — run audio_server.py) ────────────
+  try {
+    const res = await fetch(`http://localhost:7755/?v=${videoId}`,
+      { signal: AbortSignal.timeout(180000) });
+    if (res.ok && res.headers.get('content-type')?.includes('audio')) {
+      setServerBanner(false);
+      return await res.blob();
+    }
+  } catch {}
+
+  // Local server not running — show setup hint and try cloud fallbacks
+  setServerBanner(true);
+
+  // ── 2. Community Cobalt instances (no auth) ──────────────────────────────────
+  const cobaltInstances = [
+    'https://cobalt.api.timefox.me',
+    'https://co.wuk.sh',
+    'https://cobalt.tools.anojnymous.xyz',
+  ];
+  for (const base of cobaltInstances) {
+    try {
+      const res = await fetch(`${base}/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ url: ytUrl, downloadMode: 'audio', audioFormat: 'mp3' }),
+        signal: AbortSignal.timeout(12000),
+      });
+      if (!res.ok) continue;
+      const data = await res.json().catch(() => null);
+      if (!data || data.status === 'error' || !data.url) continue;
+      const audio = await fetch(data.url, { signal: AbortSignal.timeout(180000) });
+      if (audio.ok) return await audio.blob();
+    } catch {}
+  }
+
+  // ── 3. Piped instances → audio stream URL → CORS proxy ──────────────────────
+  const pipedInstances = [
+    'https://pipedapi.kavin.rocks',
+    'https://pipedapi.adminforge.de',
+    'https://pipedapi.tokhmi.xyz',
+    'https://api.piped.privacydev.net',
+  ];
+  const corsProxies = [
+    u => `https://corsproxy.io/?${u}`,
+    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  ];
+
+  for (const host of pipedInstances) {
+    try {
+      const meta = await fetch(`${host}/streams/${videoId}`, { signal: AbortSignal.timeout(8000) });
+      if (!meta.ok) continue;
+      const data = await meta.json();
+      const streams = (data.audioStreams || [])
+        .filter(s => s.url)
+        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      if (!streams.length) continue;
+
+      for (const wrap of corsProxies) {
+        try {
+          const audio = await fetch(wrap(streams[0].url), { signal: AbortSignal.timeout(180000) });
+          if (audio.ok) return await audio.blob();
+        } catch {}
+      }
+    } catch {}
+  }
+
+  throw new Error('No audio source worked. Run audio_server.py for reliable sync.');
+}
+
+// Keep old name as alias so autoSync button still works
+const fetchAudioViaCobalt = fetchYouTubeAudio;
+
 async function transcribeWithWhisper(blob, prompt) {
-  const ext  = blob.type.includes('mp4') ? 'mp4' : 'mp3';
+  const t    = blob.type;
+  const ext  = t.includes('mp4') ? 'mp4' : t.includes('webm') ? 'webm' : t.includes('ogg') ? 'ogg' : 'mp3';
   const form = new FormData();
   form.append('file', new File([blob], `audio.${ext}`, { type: blob.type || 'audio/mpeg' }));
   form.append('model', 'whisper-large-v3');
