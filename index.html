@@ -903,8 +903,35 @@ function setSyncButtons() {
 // Core sync logic — callable both from the button and from loadVideo().
 // onProgress(msg) is called with status strings; throws on failure.
 async function runAutoSync(videoId, onProgress) {
+  // ── Path A: local Python server /align (most accurate) ────────────────────
+  // Server downloads audio, transcribes with faster-whisper, aligns server-side.
+  try {
+    onProgress('Aligning via local server…');
+    const res = await fetch('http://localhost:7755/align', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ videoId, lyrics: subtitles.map(s => s.text), groqKey: getKey() }),
+      signal: AbortSignal.timeout(300000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.timestamps?.length === subtitles.length) {
+        data.timestamps.forEach(({ startMs, endMs }, i) => {
+          subtitles[i].startMs = startMs;
+          subtitles[i].endMs   = endMs;
+        });
+        hasRealSync = true;
+        setSyncButtons();
+        setServerBanner(false);
+        return;
+      }
+    }
+  } catch {}
+
+  // ── Path B: browser-side Groq Whisper + JS alignment (fallback) ────────────
+  setServerBanner(true);
   onProgress('Downloading audio…');
-  const audioBlob = await fetchAudioViaCobalt(videoId);
+  const audioBlob = await fetchYouTubeAudio(videoId);
 
   onProgress('Transcribing with Whisper…');
   const prompt = subtitles.slice(0, 8).map(s => s.text).join('\n');
@@ -914,7 +941,6 @@ async function runAutoSync(videoId, onProgress) {
   const words = result.words    || [];
   const segs  = result.segments || [];
 
-  // Try word-level first; fall back to DTW on segments
   const wordOk = words.length > 0 && alignByWords(words);
   if (!wordOk) {
     if (segs.length > 0) alignByDTW(segs);
