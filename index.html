@@ -784,29 +784,34 @@ async function analyzeLine(idx) {
   if (lineCache[idx]) return lineCache[idx];
   if (!getKey() || !subtitles[idx]) return null;
 
-  for (let attempt = 0; attempt < 5; attempt++) {
-    if (attempt > 0) await new Promise(r => setTimeout(r, 2500 * attempt));
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${getKey()}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
-          { role: 'system', content: 'You are a Japanese language expert. Respond only with valid JSON.' },
-          { role: 'user',   content: LYRIC_PROMPT + subtitles[idx].text }
-        ],
-        temperature: 0.1,
-        response_format: { type: 'json_object' }
-      })
-    });
-    if (res.status === 429) continue; // rate limited — wait and retry
-    if (!res.ok) throw new Error(`Groq ${res.status}`);
-    const data   = await res.json();
-    const result = JSON.parse(data.choices[0].message.content);
-    lineCache[idx] = result;
-    return result;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt > 0) await new Promise(r => setTimeout(r, 4000));
+    try {
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${getKey()}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          messages: [
+            { role: 'system', content: 'You are a Japanese language expert. Respond only with valid JSON.' },
+            { role: 'user',   content: LYRIC_PROMPT + subtitles[idx].text }
+          ],
+          temperature: 0.1,
+          response_format: { type: 'json_object' }
+        }),
+        signal: AbortSignal.timeout(20000),
+      });
+      if (res.status === 429) continue;
+      if (!res.ok) throw new Error(`Groq ${res.status}`);
+      const data   = await res.json();
+      const result = JSON.parse(data.choices[0].message.content);
+      lineCache[idx] = result;
+      return result;
+    } catch (e) {
+      if (attempt === 3) throw e;
+    }
   }
-  throw new Error('Rate limited');
+  throw new Error('Rate limited after 4 attempts');
 }
 
 // Pre-analyze a window of lines ahead of playback (used during video sync)
