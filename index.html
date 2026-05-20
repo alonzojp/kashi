@@ -1698,26 +1698,34 @@ async function loadVideo() {
       return;
     }
 
-    // ── 5. Analyze all lines upfront ─────────────────────
-    if (getKey()) {
-      setProgress(`Analyzing 0 / ${subtitles.length} lines…`);
-      await analyzeAll((done, total) => setProgress(`Analyzing ${done} / ${total} lines…`));
-    }
-
-    // ── 5b. Auto-sync timing when no real timestamps ──────
+    // ── 5. Auto-sync timing when no real timestamps ──────
     if (!hasRealSync && getKey()) {
       try {
         await runAutoSync(videoId, msg => setProgress(`⏱ ${msg}`));
       } catch (err) {
-        // Non-fatal — lyrics still display, just without highlighting sync
-        setProgress(`Timing unavailable (${err.message}) — showing lyrics only`);
-        await new Promise(r => setTimeout(r, 1500));
+        setProgress(`No timing available — showing lyrics only`);
+        await new Promise(r => setTimeout(r, 800));
       }
     }
 
-    // ── 6. Render everything at once ──────────────────────
+    // ── 6. Show lyrics immediately — analysis runs in background ──
     renderLyrics(subtitles);
-    if (getKey()) subtitles.forEach((_, i) => renderLineTokens(i));
+
+    // Analysis is optional and non-blocking: furigana/translations appear
+    // gradually as each line finishes. Core sync works without it.
+    if (getKey()) {
+      analyzeAll((done, total) => {
+        setStatus(`Analyzing ${done} / ${total} lines…`);
+        // render the line that just finished
+        const idx = done - 1;
+        if (idx >= 0) renderLineTokens(idx);
+      }).then(() => {
+        setStatus(`${subtitles.length} lines ready`, 'ok');
+        subtitles.forEach((_, i) => renderLineTokens(i));
+      }).catch(() => {
+        setStatus(`${subtitles.length} lines ready`, 'ok');
+      });
+    }
 
     const ci = document.getElementById('captionInfo');
     ci.style.display = 'block';
