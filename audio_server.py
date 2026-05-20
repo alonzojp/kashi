@@ -25,20 +25,19 @@ PORT = 7755
 
 # ── Capability detection ─────────────────────────────────────────────────────
 
-def _check(cmd):
-    try:
-        subprocess.run(cmd, capture_output=True, timeout=5, check=True)
-        return True
-    except Exception:
-        return False
-
-HAS_DEMUCS        = _check(['python', '-m', 'demucs', '--help'])
 HAS_FASTER_WHISPER = False
+HAS_DEMUCS         = False
 _whisper_model     = None
 
 try:
     from faster_whisper import WhisperModel
     HAS_FASTER_WHISPER = True
+except ImportError:
+    pass
+
+try:
+    import demucs          # noqa: F401 — just checking it's importable
+    HAS_DEMUCS = True
 except ImportError:
     pass
 
@@ -123,7 +122,7 @@ def separate_vocals(audio_path, work_dir):
     print("  Separating vocals (demucs)… this takes 2–5 min on CPU")
     try:
         subprocess.run(
-            ["python", "-m", "demucs",
+            [sys.executable, "-m", "demucs",
              "--two-stems", "vocals",   # only produce vocals + no_vocals
              "--out", work_dir,
              audio_path],
