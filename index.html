@@ -1930,68 +1930,27 @@ async function searchLrcLib(query, artist1 = '', artist2 = '') {
   } catch { return null; }
 }
 
-// Align clean lyric lines (text only, no timestamps) to ASR caption segments
-// (which have accurate timestamps but are fragmented word bursts).
-// Returns [{text, startMs, endMs}] or null if too few anchors found.
+// Align clean lyric lines to ASR caption segments.
+// Merges word-burst fragments by pause gaps, then proportionally maps
+// lrclib lines across the merged segments — no text matching, so it
+// never "runs out" of anchors partway through.
 function alignTextToAsr(lyricTexts, asrSegs) {
-  const validSegs = asrSegs.filter(s => normalizeForAlign(s.text).length > 0);
-  if (!validSegs.length) return null;
+  const merged = mergeAsrSegments(asrSegs, 900);
+  if (merged.length < 2) return null;
 
-  const fullAsr  = validSegs.map(s => normalizeForAlign(s.text)).join('');
-  const pos2seg  = [];
-  validSegs.forEach((s, si) => {
-    for (let i = 0; i < normalizeForAlign(s.text).length; i++) pos2seg.push(si);
+  const n = lyricTexts.length;
+  const m = merged.length;
+
+  return lyricTexts.map((text, i) => {
+    // Proportional position in merged segments
+    const t  = n > 1 ? i / (n - 1) : 0;
+    const si = Math.min(Math.round(t * (m - 1)), m - 1);
+    return {
+      text,
+      startMs: merged[si].startMs,
+      endMs:   si + 1 < m ? merged[si + 1].startMs : merged[si].endMs,
+    };
   });
-
-  const anchors = [];
-  let cursor = 0;
-  lyricTexts.forEach((line, li) => {
-    const norm = normalizeForAlign(line);
-    if (!norm) return;
-    for (let plen = Math.min(norm.length, 10); plen >= 2; plen--) {
-      const idx = fullAsr.indexOf(norm.slice(0, plen), cursor);
-      if (idx < 0) continue;
-      const si = pos2seg[idx] ?? 0;
-      anchors.push({ li, startMs: validSegs[si].startMs });
-      cursor = idx + 1;
-      break;
-    }
-  });
-
-  if (anchors.length < Math.ceil(lyricTexts.length * 0.3)) return null;
-
-  const n   = lyricTexts.length;
-  const raw = new Array(n).fill(null);
-  anchors.forEach(({ li, startMs }) => { raw[li] = startMs; });
-
-  const avgMs = anchors.length > 1
-    ? (anchors[anchors.length-1].startMs - anchors[0].startMs)
-      / (anchors[anchors.length-1].li - anchors[0].li)
-    : 3000;
-
-  const first = anchors[0];
-  for (let i = 0; i < first.li; i++)
-    raw[i] = first.li > 0 ? Math.round((i / first.li) * first.startMs) : 0;
-
-  for (let k = 0; k < anchors.length - 1; k++) {
-    const a = anchors[k], b = anchors[k+1];
-    for (let i = a.li + 1; i < b.li; i++) {
-      raw[i] = Math.round(a.startMs + ((i - a.li) / (b.li - a.li)) * (b.startMs - a.startMs));
-    }
-  }
-
-  const last = anchors[anchors.length-1];
-  for (let i = last.li + 1; i < n; i++)
-    raw[i] = Math.round(last.startMs + (i - last.li) * avgMs);
-
-  for (let i = 1; i < n; i++)
-    if (raw[i] === null || raw[i] <= raw[i-1]) raw[i] = raw[i-1] + 400;
-
-  return lyricTexts.map((text, i) => ({
-    text,
-    startMs: raw[i] ?? i * 3000,
-    endMs:   i + 1 < n ? (raw[i+1] ?? raw[i] + 3000) : (raw[i] + 8000),
-  }));
 }
 
 // Merge word-burst ASR segments into lyric-line-sized chunks by joining
