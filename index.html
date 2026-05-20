@@ -1597,7 +1597,10 @@ async function loadVideo() {
   let asrSegments = null; // raw ASR timing segments (may be 60+ fragments)
 
   try {
-    // ── 0. yt-dlp captions via local server ──────────────────
+    // ── 0. yt-dlp captions → timing source only (asrSegments) ──
+    // Music video captions are often word-timed karaoke segments, not lyric
+    // lines — even "manual" ones. Never use them directly as subtitles;
+    // always align clean lrclib text against their timestamps instead.
     setProgress('Fetching captions…');
     try {
       const capRes = await fetch(`http://localhost:7755/captions?v=${videoId}`,
@@ -1605,35 +1608,17 @@ async function loadVideo() {
       if (capRes.ok) {
         const cap = await capRes.json();
         if (cap.lines?.length > 1) {
+          asrSegments = cap.lines;
           setServerBanner(false);
-          if (cap.source === 'manual') {
-            // Manual captions are clean lyric lines → use directly
-            subtitles   = cap.lines;
-            hasRealSync = true;
-            source      = 'YouTube captions';
-          } else {
-            // ASR captions are word-burst fragments → save for timing only,
-            // we'll align clean lrclib text against these timestamps below
-            asrSegments = cap.lines;
-          }
         }
       }
     } catch {}
 
-    // ── 1. Page-scrape captions (no server / manual captions only) ──
-    const page = !subtitles.length ? await fetchYouTubePage(videoId) : null;
-    if (page && !subtitles.length) {
-      setProgress('Scanning for Japanese captions…');
+    // ── 1. Page-scrape captions → also just timing source ────
+    const page = await fetchYouTubePage(videoId);
+    if (page && !asrSegments) {
       const captionResult = await captionsFromPageHtml(page.html, page.proxy);
-      if (captionResult?.lines.length) {
-        if (!captionResult.auto) {
-          subtitles   = captionResult.lines;
-          hasRealSync = true;
-          source      = 'YouTube captions';
-        } else if (!asrSegments) {
-          asrSegments = captionResult.lines; // use as timing source
-        }
-      }
+      if (captionResult?.lines.length) asrSegments = captionResult.lines;
     }
 
     // ── 2. lrclib — clean lyric text (+ timing if synced) ────
@@ -1679,14 +1664,35 @@ async function loadVideo() {
     if (!subtitles.length && page) {
       setProgress('Checking video description…');
       const descLines = await fetchFromDescription(videoId, page);
-      if (descLines?.length > 2) { subtitles = descLines; source = 'Video description'; }
+      if (descLines?.length > 2) {
+        subtitles = asrSegments
+          ? (alignTextToAsr(descLines.map(l => l.text), asrSegments) || descLines)
+          : descLines;
+        if (asrSegments && subtitles !== descLines) hasRealSync = true;
+        source = 'Video description';
+      }
     }
 
     // ── 4. Pinned comment ─────────────────────────────────
     if (!subtitles.length && getYtKey()) {
       setProgress('Checking pinned comment…');
       const commentLines = await fetchPinnedComment(videoId);
-      if (commentLines?.length > 3) { subtitles = commentLines; source = 'Pinned comment'; }
+      if (commentLines?.length > 3) {
+        subtitles = asrSegments
+          ? (alignTextToAsr(commentLines.map(l => l.text), asrSegments) || commentLines)
+          : commentLines;
+        if (asrSegments && subtitles !== commentLines) hasRealSync = true;
+        source = 'Pinned comment';
+      }
+    }
+
+    // ── 4b. Merge ASR segments as last-resort text source ──
+    // If we have ASR captions but no clean lyric text, merge consecutive
+    // segments separated by < 900ms into lyric-line-sized chunks.
+    if (!subtitles.length && asrSegments?.length) {
+      subtitles   = mergeAsrSegments(asrSegments, 900);
+      hasRealSync = true;
+      source      = 'Auto-generated captions';
     }
 
     if (!subtitles.length) {
@@ -1986,6 +1992,23 @@ function alignTextToAsr(lyricTexts, asrSegs) {
     startMs: raw[i] ?? i * 3000,
     endMs:   i + 1 < n ? (raw[i+1] ?? raw[i] + 3000) : (raw[i] + 8000),
   }));
+}
+
+// Merge word-burst ASR segments into lyric-line-sized chunks by joining
+// consecutive segments whose gap is smaller than gapMs.
+function mergeAsrSegments(segs, gapMs = 900) {
+  if (!segs.length) return [];
+  const out = [{ ...segs[0] }];
+  for (let i = 1; i < segs.length; i++) {
+    const prev = out[out.length - 1];
+    if (segs[i].startMs - prev.endMs <= gapMs) {
+      prev.text  = (prev.text + ' ' + segs[i].text).trim();
+      prev.endMs = segs[i].endMs;
+    } else {
+      out.push({ ...segs[i] });
+    }
+  }
+  return out;
 }
 
 function lyricsToLines(plainLyrics) {
