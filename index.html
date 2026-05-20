@@ -1594,9 +1594,10 @@ async function loadVideo() {
   };
 
   let source = '';
+  let asrSegments = null; // raw ASR timing segments (may be 60+ fragments)
 
   try {
-    // ── 0. yt-dlp captions via local server (most reliable) ──
+    // ── 0. yt-dlp captions via local server ──────────────────
     setProgress('Fetching captions…');
     try {
       const capRes = await fetch(`http://localhost:7755/captions?v=${videoId}`,
@@ -1604,50 +1605,70 @@ async function loadVideo() {
       if (capRes.ok) {
         const cap = await capRes.json();
         if (cap.lines?.length > 1) {
-          subtitles   = cap.lines;
-          hasRealSync = true;
-          source      = cap.source === 'manual' ? 'YouTube captions' : 'Auto-generated captions';
           setServerBanner(false);
+          if (cap.source === 'manual') {
+            // Manual captions are clean lyric lines → use directly
+            subtitles   = cap.lines;
+            hasRealSync = true;
+            source      = 'YouTube captions';
+          } else {
+            // ASR captions are word-burst fragments → save for timing only,
+            // we'll align clean lrclib text against these timestamps below
+            asrSegments = cap.lines;
+          }
         }
       }
     } catch {}
 
-    // ── 1. Page-scrape captions (fallback when server not running) ──
+    // ── 1. Page-scrape captions (no server / manual captions only) ──
     const page = !subtitles.length ? await fetchYouTubePage(videoId) : null;
-
-    if (page) {
+    if (page && !subtitles.length) {
       setProgress('Scanning for Japanese captions…');
       const captionResult = await captionsFromPageHtml(page.html, page.proxy);
       if (captionResult?.lines.length) {
-        subtitles   = captionResult.lines;
-        hasRealSync = true;
-        source      = captionResult.auto ? 'Auto-generated captions' : 'YouTube captions';
+        if (!captionResult.auto) {
+          subtitles   = captionResult.lines;
+          hasRealSync = true;
+          source      = 'YouTube captions';
+        } else if (!asrSegments) {
+          asrSegments = captionResult.lines; // use as timing source
+        }
       }
     }
 
-    // ── 2. lrclib.net — prefer syncedLyrics for real timestamps ──
+    // ── 2. lrclib — clean lyric text (+ timing if synced) ────
     if (!subtitles.length) {
       setProgress('Searching lyrics database…');
       try {
-        const oembed   = await getYouTubeOembed(videoId);
-        const rawTitle = oembed?.title || '';
-        const cleaned  = cleanVideoTitle(rawTitle);
-        if (cleaned) {
-          // Extract artist/track from title patterns like ARTIST「SONG」 or ARTIST - SONG
-          const { artist: titleArtist, track } = extractArtistAndTrack(cleaned);
-          // Channel name often has " - Topic" suffix for auto-generated music channels
-          const channelArtist = cleanChannelName(oembed?.author_name || '');
-          const searchTrack = track || cleaned;
-          // Pass title-extracted artist and channel name as two candidates
-          const result = await searchLrcLib(searchTrack, titleArtist, channelArtist);
-          if (result?.syncedLyrics) {
-            subtitles   = parseLRC(result.syncedLyrics);
-            hasRealSync = subtitles.length > 0;
-            const info  = [result.artistName, result.trackName].filter(Boolean).join(' – ');
-            source      = `lrclib (timed)${info ? ': ' + info : ''}`;
-          } else if (result?.plainLyrics) {
-            subtitles = lyricsToLines(result.plainLyrics);
-            const info = [result.artistName, result.trackName].filter(Boolean).join(' – ');
+        const oembed       = await getYouTubeOembed(videoId);
+        const cleaned      = cleanVideoTitle(oembed?.title || '');
+        const { artist: titleArtist, track } = extractArtistAndTrack(cleaned);
+        const channelArtist = cleanChannelName(oembed?.author_name || '');
+        const result = cleaned
+          ? await searchLrcLib(track || cleaned, titleArtist, channelArtist)
+          : null;
+
+        if (result?.syncedLyrics) {
+          subtitles   = parseLRC(result.syncedLyrics);
+          hasRealSync = subtitles.length > 0;
+          const info  = [result.artistName, result.trackName].filter(Boolean).join(' – ');
+          source      = `lrclib (timed)${info ? ': ' + info : ''}`;
+        } else if (result?.plainLyrics) {
+          const lrcLines = lyricsToLines(result.plainLyrics);
+          const info     = [result.artistName, result.trackName].filter(Boolean).join(' – ');
+          if (asrSegments) {
+            // Align clean lrclib text against ASR timestamps
+            const aligned = alignTextToAsr(lrcLines.map(l => l.text), asrSegments);
+            if (aligned) {
+              subtitles   = aligned;
+              hasRealSync = true;
+              source      = `lrclib + ASR timing${info ? ': ' + info : ''}`;
+            } else {
+              subtitles = lrcLines;
+              source    = `lrclib${info ? ': ' + info : ''}`;
+            }
+          } else {
+            subtitles = lrcLines;
             source    = `lrclib${info ? ': ' + info : ''}`;
           }
         }
@@ -1893,6 +1914,70 @@ async function searchLrcLib(query, artist1 = '', artist2 = '') {
     if (!res.ok) return null;
     return pickBest(await res.json());
   } catch { return null; }
+}
+
+// Align clean lyric lines (text only, no timestamps) to ASR caption segments
+// (which have accurate timestamps but are fragmented word bursts).
+// Returns [{text, startMs, endMs}] or null if too few anchors found.
+function alignTextToAsr(lyricTexts, asrSegs) {
+  const validSegs = asrSegs.filter(s => normalizeForAlign(s.text).length > 0);
+  if (!validSegs.length) return null;
+
+  const fullAsr  = validSegs.map(s => normalizeForAlign(s.text)).join('');
+  const pos2seg  = [];
+  validSegs.forEach((s, si) => {
+    for (let i = 0; i < normalizeForAlign(s.text).length; i++) pos2seg.push(si);
+  });
+
+  const anchors = [];
+  let cursor = 0;
+  lyricTexts.forEach((line, li) => {
+    const norm = normalizeForAlign(line);
+    if (!norm) return;
+    for (let plen = Math.min(norm.length, 10); plen >= 2; plen--) {
+      const idx = fullAsr.indexOf(norm.slice(0, plen), cursor);
+      if (idx < 0) continue;
+      const si = pos2seg[idx] ?? 0;
+      anchors.push({ li, startMs: validSegs[si].startMs });
+      cursor = idx + 1;
+      break;
+    }
+  });
+
+  if (anchors.length < Math.ceil(lyricTexts.length * 0.3)) return null;
+
+  const n   = lyricTexts.length;
+  const raw = new Array(n).fill(null);
+  anchors.forEach(({ li, startMs }) => { raw[li] = startMs; });
+
+  const avgMs = anchors.length > 1
+    ? (anchors[anchors.length-1].startMs - anchors[0].startMs)
+      / (anchors[anchors.length-1].li - anchors[0].li)
+    : 3000;
+
+  const first = anchors[0];
+  for (let i = 0; i < first.li; i++)
+    raw[i] = first.li > 0 ? Math.round((i / first.li) * first.startMs) : 0;
+
+  for (let k = 0; k < anchors.length - 1; k++) {
+    const a = anchors[k], b = anchors[k+1];
+    for (let i = a.li + 1; i < b.li; i++) {
+      raw[i] = Math.round(a.startMs + ((i - a.li) / (b.li - a.li)) * (b.startMs - a.startMs));
+    }
+  }
+
+  const last = anchors[anchors.length-1];
+  for (let i = last.li + 1; i < n; i++)
+    raw[i] = Math.round(last.startMs + (i - last.li) * avgMs);
+
+  for (let i = 1; i < n; i++)
+    if (raw[i] === null || raw[i] <= raw[i-1]) raw[i] = raw[i-1] + 400;
+
+  return lyricTexts.map((text, i) => ({
+    text,
+    startMs: raw[i] ?? i * 3000,
+    endMs:   i + 1 < n ? (raw[i+1] ?? raw[i] + 3000) : (raw[i] + 8000),
+  }));
 }
 
 function lyricsToLines(plainLyrics) {
