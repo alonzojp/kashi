@@ -1714,24 +1714,8 @@ async function loadVideo() {
       }
     }
 
-    // ── 6. Show lyrics immediately — analysis runs in background ──
+    // ── 6. Show lyrics — analysis happens on word click only ──
     renderLyrics(subtitles);
-
-    // Analysis is optional and non-blocking: furigana/translations appear
-    // gradually as each line finishes. Core sync works without it.
-    if (getKey()) {
-      analyzeAll((done, total) => {
-        setStatus(`Analyzing ${done} / ${total} lines…`);
-        // render the line that just finished
-        const idx = done - 1;
-        if (idx >= 0) renderLineTokens(idx);
-      }).then(() => {
-        setStatus(`${subtitles.length} lines ready`, 'ok');
-        subtitles.forEach((_, i) => renderLineTokens(i));
-      }).catch(() => {
-        setStatus(`${subtitles.length} lines ready`, 'ok');
-      });
-    }
 
     const ci = document.getElementById('captionInfo');
     ci.style.display = 'block';
@@ -1931,9 +1915,9 @@ async function searchLrcLib(query, artist1 = '', artist2 = '') {
 }
 
 // Align clean lyric lines to ASR caption segments.
-// Merges word-burst fragments by pause gaps, then proportionally maps
-// lrclib lines across the merged segments — no text matching, so it
-// never "runs out" of anchors partway through.
+// Merges word-burst fragments by pause gaps, maps lrclib lines proportionally,
+// then distributes lines that share a segment evenly within it so every line
+// gets a unique startMs (prevents syncTime from jumping past multiple lines at once).
 function alignTextToAsr(lyricTexts, asrSegs) {
   const merged = mergeAsrSegments(asrSegs, 900);
   if (merged.length < 2) return null;
@@ -1941,15 +1925,27 @@ function alignTextToAsr(lyricTexts, asrSegs) {
   const n = lyricTexts.length;
   const m = merged.length;
 
+  // Assign each lyric line to its proportional merged segment
+  const si_of = lyricTexts.map((_, i) =>
+    Math.min(Math.round((n > 1 ? i / (n - 1) : 0) * (m - 1)), m - 1)
+  );
+
   return lyricTexts.map((text, i) => {
-    // Proportional position in merged segments
-    const t  = n > 1 ? i / (n - 1) : 0;
-    const si = Math.min(Math.round(t * (m - 1)), m - 1);
-    return {
-      text,
-      startMs: merged[si].startMs,
-      endMs:   si + 1 < m ? merged[si + 1].startMs : merged[si].endMs,
-    };
+    const si      = si_of[i];
+    const seg     = merged[si];
+    const nextSeg = merged[si + 1];
+    const segEnd  = nextSeg ? nextSeg.startMs : seg.endMs;
+    const segDur  = Math.max(segEnd - seg.startMs, 100);
+
+    // Find how many lines share this segment and which position this line is
+    const groupLines   = si_of.reduce((a, s, idx) => { if (s === si) a.push(idx); return a; }, []);
+    const posInGroup   = groupLines.indexOf(i);
+    const groupSize    = groupLines.length;
+
+    const startMs = seg.startMs + Math.round((posInGroup / groupSize) * segDur);
+    const endMs   = seg.startMs + Math.round(((posInGroup + 1) / groupSize) * segDur);
+
+    return { text, startMs, endMs };
   });
 }
 
